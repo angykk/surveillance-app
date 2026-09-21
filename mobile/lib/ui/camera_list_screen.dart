@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 import '../webrtc/signaling_client.dart';
+import 'theme_controller.dart';
 import 'viewer_screen.dart';
 
 class CameraInfo {
@@ -21,7 +22,9 @@ class CameraInfo {
 /// opening a new connection, so switching cameras doesn't mean a full
 /// reconnect.
 class CameraListScreen extends StatefulWidget {
-  const CameraListScreen({super.key});
+  const CameraListScreen({super.key, required this.themeController});
+
+  final ThemeController themeController;
 
   @override
   State<CameraListScreen> createState() => _CameraListScreenState();
@@ -84,7 +87,10 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Cameras')),
+      appBar: AppBar(
+        title: const Text('Cameras'),
+        actions: [_ThemeModeMenu(themeController: widget.themeController)],
+      ),
       body: !_connected
           ? const Center(child: CircularProgressIndicator())
           : _cameras.isEmpty
@@ -158,6 +164,60 @@ class _CameraLeadingIcon extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+/// AppBar action for picking the app's light/dark/system theme. Lives on
+/// Viewer Mode's screens only — Camera Mode runs unattended, so there's no
+/// one around to appreciate a theme switch there.
+class _ThemeModeMenu extends StatelessWidget {
+  const _ThemeModeMenu({required this.themeController});
+
+  final ThemeController themeController;
+
+  static const _labels = {
+    ThemeMode.system: 'System default',
+    ThemeMode.light: 'Light',
+    ThemeMode.dark: 'Dark',
+  };
+
+  static const _icons = {
+    ThemeMode.system: Icons.brightness_auto_outlined,
+    ThemeMode.light: Icons.light_mode_outlined,
+    ThemeMode.dark: Icons.dark_mode_outlined,
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeController,
+      builder: (context, mode, _) {
+        return PopupMenuButton<ThemeMode>(
+          icon: Icon(_icons[mode]),
+          tooltip: 'Theme',
+          initialValue: mode,
+          onSelected: themeController.setMode,
+          itemBuilder: (context) => ThemeMode.values
+              .map(
+                (m) => PopupMenuItem(
+                  value: m,
+                  child: Row(
+                    children: [
+                      Icon(_icons[m], size: 20),
+                      const SizedBox(width: 12),
+                      Text(_labels[m]!),
+                      if (m == mode) ...[
+                        const Spacer(),
+                        const Icon(Icons.check, size: 18),
+                      ],
+                    ],
+                  ),
+                ),
+              )
+              .toList(),
+        );
+      },
     );
   }
 }

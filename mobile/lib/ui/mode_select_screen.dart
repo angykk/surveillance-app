@@ -2,11 +2,16 @@ import 'package:flutter/material.dart';
 
 import '../camera/camera_screen.dart';
 import 'camera_list_screen.dart';
+import 'theme_controller.dart';
 
 /// Entry screen: choose whether this device acts as a Camera/Server or a
 /// Viewer/Client.
 class ModeSelectScreen extends StatelessWidget {
-  const ModeSelectScreen({super.key});
+  const ModeSelectScreen({super.key, required this.themeController});
+
+  /// Only handed to Viewer Mode below — Camera Mode runs unattended as a
+  /// fixed video feed, so a theme toggle has nothing to offer there.
+  final ThemeController themeController;
 
   @override
   Widget build(BuildContext context) {
@@ -40,7 +45,9 @@ class ModeSelectScreen extends StatelessWidget {
                 title: 'Viewer Mode',
                 subtitle: 'View and manage your cameras',
                 onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const CameraListScreen()),
+                  MaterialPageRoute(
+                    builder: (_) => CameraListScreen(themeController: themeController),
+                  ),
                 ),
               ),
             ],
