@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -19,6 +20,16 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 RECORDINGS_DIR = os.path.join(DATA_DIR, 'recordings')
 DB_PATH = os.path.join(DATA_DIR, 'recordings.db')
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
+
+# camera_id is client-supplied and used as a directory name under
+# RECORDINGS_DIR, so it's restricted to the 32-hex-char format the mobile
+# app generates (see CameraIdentity._generateId) — anything else could
+# escape RECORDINGS_DIR via `..` or path separators.
+_CAMERA_ID_RE = re.compile(r'^[0-9a-f]{32}$')
+
+
+def _valid_camera_id(camera_id):
+    return bool(camera_id) and _CAMERA_ID_RE.fullmatch(camera_id) is not None
 
 
 def _db():
@@ -49,7 +60,7 @@ def upload_recording():
     camera_id = request.form.get('camera_id')
     camera_name = request.form.get('camera_name') or camera_id
     file = request.files.get('file')
-    if not camera_id or file is None:
+    if not _valid_camera_id(camera_id) or file is None:
         abort(400)
 
     recording_id = uuid.uuid4().hex
@@ -159,8 +170,8 @@ def on_connect():
     if role == 'camera':
         camera_id = request.args.get('camera_id')
         camera_name = request.args.get('camera_name') or camera_id
-        if not camera_id:
-            print(f"Rejecting camera connection {request.sid}: missing camera_id")
+        if not _valid_camera_id(camera_id):
+            print(f"Rejecting camera connection {request.sid}: missing/invalid camera_id")
             return False
 
         stale = cameras.get(camera_id)
@@ -285,4 +296,7 @@ def on_icecandidate(data):
 
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5050, debug=True, allow_unsafe_werkzeug=True)
+    # Debug mode exposes the Werkzeug debugger (arbitrary code execution) to
+    # anyone who can reach the server, so it's opt-in for local development.
+    debug = os.environ.get('FLASK_DEBUG') == '1'
+    socketio.run(app, host='0.0.0.0', port=5050, debug=debug, allow_unsafe_werkzeug=True)
