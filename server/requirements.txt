@@ -1,2 +1,5 @@
 Flask==3.1.0
 Flask-SocketIO==5.4.1
+supabase==2.33.0
+PyJWT[crypto]>=2.9,<3
+python-dotenv>=1.0,<2

@@ -20,6 +20,10 @@ dependencies:
   opencv_dart: ^2.2.2
   shared_preferences: ^2.3.2
   http: ^1.2.2
+  supabase_flutter: ^2.18.3
+  mobile_scanner: ^7.4.2
+  qr_flutter: ^4.1.0
+  flutter_secure_storage: ^11.2.0
 
 dev_dependencies:
   flutter_test:

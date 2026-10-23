@@ -2,19 +2,27 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../api/api_client.dart';
+import '../config.dart';
 import '../motion/motion_detector.dart';
 import '../recording/recording_manager.dart';
 import '../recording/recordings_api.dart';
 import '../recording/recordings_screen.dart';
 import '../webrtc/signaling_client.dart';
-import 'camera_identity.dart';
+import 'device_credentials.dart';
 
 class CameraScreen extends StatefulWidget {
-  const CameraScreen({super.key});
+  const CameraScreen({super.key, required this.credentials, required this.onUnpaired});
+
+  final DeviceCredentials credentials;
+
+  /// Called when the server refuses this camera's device token — it was
+  /// removed from its household in Viewer Mode — so the caller can clear
+  /// the stale credentials and return to pairing.
+  final VoidCallback onUnpaired;
 
   @override
   State<CameraScreen> createState() => _CameraScreenState();
@@ -33,14 +41,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   final _localRenderer = RTCVideoRenderer();
   final _recordingManager = RecordingManager();
   final _motionDetector = MotionDetector();
-  late final _recordingsApi = RecordingsApi(dotenv.env['SERVER_IP']!);
-
-  // Not created until the persisted camera identity has loaded (registering
-  // with the server needs a stable camera_id), so this starts null rather
-  // than `late final` — everything that touches it must go through `?.` or
-  // an early-return null check.
-  SignalingClient? _signaling;
-  CameraIdentity? _identity;
+  late final _recordingsApi = RecordingsApi(
+    ApiClient.forDevice(AppConfig.serverUrl, widget.credentials.token),
+  );
+  late final SignalingClient _signaling;
+  late DeviceCredentials _credentials = widget.credentials;
 
   MediaStream? _localStream;
   MediaRecorder? _mediaRecorder;
@@ -60,69 +65,58 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _init();
+    _connectSignaling();
+    _setup();
   }
 
-  Future<void> _init() async {
-    final identity = await CameraIdentity.load();
-    if (!mounted) return;
-    setState(() => _identity = identity);
-    _connectSignaling(identity);
-    await _setup();
+  /// Creates the signaling socket and registers its listeners. Registered
+  /// once: `_setup` re-connects on every resume, but socket_io_client keeps
+  /// listeners across disconnects, so registering them here (rather than in
+  /// `_setup`) avoids piling up duplicates.
+  void _connectSignaling() {
+    final token = widget.credentials.token;
+    _signaling = SignalingClient(AppConfig.serverUrl, auth: () async => {'device_token': token});
 
-    // Nudge for a real name right away, before this camera ever shows up in
-    // a viewer's picker under the generic default — that's what made
-    // same-named cameras indistinguishable there.
-    if (identity.isUnnamed && mounted) await _showRenameDialog(firstRun: true);
-  }
-
-  /// Creates the signaling socket for the given identity and registers its
-  /// listeners. Registered once per socket instance: `_setup` re-connects on
-  /// every resume, but socket_io_client keeps listeners across disconnects,
-  /// so registering them here (rather than in `_setup`) avoids piling up
-  /// duplicates. Called again on rename, which needs a fresh socket since
-  /// `camera_name` is sent as a connect-time query param.
-  void _connectSignaling(CameraIdentity identity) {
-    final signaling = SignalingClient(
-      dotenv.env['SERVER_IP']!,
-      role: 'camera',
-      extraQuery: {'camera_id': identity.id, 'camera_name': identity.name},
-    );
-    _signaling = signaling;
-
-    signaling.socket.on('connect', (_) {
+    _signaling.socket.on('connect', (_) {
       if (mounted) setState(() => _viewerStatus = 'Waiting for a viewer…');
     });
-    signaling.socket.on('peer-joined', (_) => _startStreamingToViewer());
-    signaling.socket.on('peer-left', (_) => _stopStreamingToViewer());
-    signaling.socket.on('answer', _handleAnswer);
-    signaling.socket.on('icecandidate', signaling.addRemoteIceCandidate);
+    _signaling.socket.on('connect_error', (data) {
+      if (SignalingClient.refusalReason(data) == 'device_revoked') {
+        widget.onUnpaired();
+      } else if (mounted) {
+        setState(() => _viewerStatus = 'Can\'t reach the server — retrying…');
+      }
+    });
+    _signaling.socket.on('peer-joined', (_) => _startStreamingToViewer());
+    _signaling.socket.on('peer-left', (_) => _stopStreamingToViewer());
+    _signaling.socket.on('answer', _handleAnswer);
+    _signaling.socket.on('icecandidate', _signaling.addRemoteIceCandidate);
   }
 
   Future<void> _renameCamera(String newName) async {
     final trimmed = newName.trim();
-    if (trimmed.isEmpty) return;
+    if (trimmed.isEmpty || trimmed == _credentials.name) return;
 
-    await CameraIdentity.saveName(trimmed);
-    final identity = CameraIdentity(id: _identity!.id, name: trimmed, isUnnamed: false);
-    if (!mounted) return;
-    setState(() => _identity = identity);
-
-    // camera_name only takes effect at connect time, so the rename has to
-    // reconnect with a fresh socket rather than just relabeling in place.
-    await _stopStreamingToViewer();
-    _signaling?.dispose();
-    _connectSignaling(identity);
-    _signaling?.socket.connect();
+    // The server pushes the new name to viewers' rosters itself, so unlike
+    // the old connect-time `camera_name`, this doesn't need a reconnect.
+    try {
+      await _credentials.rename(AppConfig.serverUrl, trimmed);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Rename failed: $e')));
+      return;
+    }
+    final updated = _credentials.withName(trimmed);
+    await updated.save();
+    if (mounted) setState(() => _credentials = updated);
   }
 
-  Future<void> _showRenameDialog({bool firstRun = false}) async {
-    final controller = TextEditingController(text: firstRun ? '' : (_identity?.name ?? ''));
+  Future<void> _showRenameDialog() async {
+    final controller = TextEditingController(text: _credentials.name);
     final newName = await showDialog<String>(
       context: context,
-      barrierDismissible: !firstRun,
       builder: (context) => AlertDialog(
-        title: Text(firstRun ? 'Name this camera' : 'Camera name'),
+        title: const Text('Camera name'),
         content: TextField(
           controller: controller,
           autofocus: true,
@@ -130,11 +124,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           onSubmitted: (value) => Navigator.of(context).pop(value),
         ),
         actions: [
-          if (!firstRun)
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: const Text('Cancel'),
-            ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
           FilledButton(
             onPressed: () => Navigator.of(context).pop(controller.text),
             child: const Text('Save'),
@@ -190,7 +183,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
     if (!mounted) return;
     setState(() => _status = _Status.ready);
-    _signaling?.socket.connect();
+    _signaling.socket.connect();
     _motionTimer = Timer.periodic(_motionCheckInterval, (_) => _checkForMotion());
   }
 
@@ -256,14 +249,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   /// it just means it's only visible in this device's own Recordings list
   /// until the next successful upload.
   Future<void> _uploadRecording(File file) async {
-    final identity = _identity;
-    if (identity == null) return;
     try {
-      await _recordingsApi.uploadRecording(
-        file: file,
-        cameraId: identity.id,
-        cameraName: identity.name,
-      );
+      await _recordingsApi.uploadRecording(file);
     } catch (e) {
       debugPrint('Recording upload failed, keeping local copy only: $e');
     }
@@ -272,7 +259,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   Future<void> _startStreamingToViewer() async {
     final stream = _localStream;
     final signaling = _signaling;
-    if (stream == null || signaling == null) return;
+    if (stream == null) return;
 
     final pc = await signaling.createConnection();
     for (final track in stream.getTracks()) {
@@ -286,7 +273,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   }
 
   Future<void> _stopStreamingToViewer() async {
-    await _signaling?.resetConnection();
+    await _signaling.resetConnection();
     if (mounted) {
       setState(() {
         _isLiveToViewer = false;
@@ -297,8 +284,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
   Future<void> _handleAnswer(dynamic data) async {
     final signaling = _signaling;
-    final pc = signaling?.pc;
-    if (signaling == null || pc == null) return;
+    final pc = signaling.pc;
+    if (pc == null) return;
     if (pc.signalingState != RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
       return;
     }
@@ -315,8 +302,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _motionTimer?.cancel();
     _motionTimer = null;
     if (_isRecording) await _stopMotionRecording();
-    await _signaling?.resetConnection();
-    _signaling?.socket.disconnect();
+    await _signaling.resetConnection();
+    _signaling.socket.disconnect();
     // Detach the renderer before disposing the stream it's showing — doing
     // it the other way round throws "Got exception for
     // RTCVideoRenderer::setSrcObject: null" trying to detach from a stream
@@ -344,15 +331,15 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _motionDetector.dispose();
     _localRenderer.dispose();
     _teardown();
-    _signaling?.dispose();
+    _signaling.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final title = _status == _Status.ready
-        ? '${_identity?.name ?? 'Camera'} — $_viewerStatus'
-        : _identity?.name ?? 'Camera Mode';
+        ? '${_credentials.name} — $_viewerStatus'
+        : _credentials.name;
     return Scaffold(
       appBar: AppBar(
         title: Text(title),
@@ -360,7 +347,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           IconButton(
             icon: const Icon(Icons.edit_outlined),
             tooltip: 'Rename camera',
-            onPressed: _identity == null ? null : _showRenameDialog,
+            onPressed: _showRenameDialog,
           ),
           IconButton(
             icon: const Icon(Icons.video_library_outlined),

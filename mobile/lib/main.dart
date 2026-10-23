@@ -1,11 +1,17 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'config.dart';
 import 'ui/mode_select_screen.dart';
 import 'ui/theme_controller.dart';
 
 Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
   await dotenv.load(fileName: '.env');
+  // Only Viewer Mode signs in, but initializing up front lets
+  // supabase_flutter restore a persisted session before the first frame.
+  await Supabase.initialize(url: AppConfig.supabaseUrl, publishableKey: AppConfig.supabasePublishableKey);
   runApp(const MainApp());
 }
 

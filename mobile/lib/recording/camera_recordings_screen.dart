@@ -11,21 +11,25 @@ import 'recordings_api.dart';
 class CameraRecordingsScreen extends StatefulWidget {
   const CameraRecordingsScreen({
     super.key,
-    required this.serverUrl,
+    required this.api,
     required this.cameraId,
     required this.cameraName,
+    required this.canDelete,
   });
 
-  final String serverUrl;
+  final RecordingsApi api;
   final String cameraId;
   final String cameraName;
+
+  /// Only household owners/admins can delete; the server enforces this too.
+  final bool canDelete;
 
   @override
   State<CameraRecordingsScreen> createState() => _CameraRecordingsScreenState();
 }
 
 class _CameraRecordingsScreenState extends State<CameraRecordingsScreen> {
-  late final _api = RecordingsApi(widget.serverUrl);
+  RecordingsApi get _api => widget.api;
   List<RemoteRecording> _recordings = [];
   bool _loading = true;
   String? _error;
@@ -108,14 +112,17 @@ class _CameraRecordingsScreenState extends State<CameraRecordingsScreen> {
                           onTap: () => Navigator.of(context).push(
                             MaterialPageRoute(
                               builder: (_) => _RemotePlaybackScreen(
-                                url: _api.fileUrl(recording.id),
+                                api: _api,
+                                recordingId: recording.id,
                               ),
                             ),
                           ),
-                          trailing: IconButton(
-                            icon: const Icon(Icons.delete_outline),
-                            onPressed: () => _delete(recording),
-                          ),
+                          trailing: widget.canDelete
+                              ? IconButton(
+                                  icon: const Icon(Icons.delete_outline),
+                                  onPressed: () => _delete(recording),
+                                )
+                              : null,
                         );
                       },
                     ),
@@ -124,35 +131,49 @@ class _CameraRecordingsScreenState extends State<CameraRecordingsScreen> {
 }
 
 class _RemotePlaybackScreen extends StatefulWidget {
-  final Uri url;
-  const _RemotePlaybackScreen({required this.url});
+  final RecordingsApi api;
+  final String recordingId;
+  const _RemotePlaybackScreen({required this.api, required this.recordingId});
 
   @override
   State<_RemotePlaybackScreen> createState() => _RemotePlaybackScreenState();
 }
 
 class _RemotePlaybackScreenState extends State<_RemotePlaybackScreen> {
-  late final VideoPlayerController _controller;
+  // Created once the auth headers are in hand, since clips are only served
+  // to members of the camera's household.
+  VideoPlayerController? _controller;
   bool _ready = false;
   String? _error;
 
   @override
   void initState() {
     super.initState();
-    _controller = VideoPlayerController.networkUrl(widget.url)
-      ..initialize().then((_) {
-        if (!mounted) return;
-        setState(() => _ready = true);
-        _controller.play();
-      }).catchError((Object e) {
-        if (!mounted) return;
-        setState(() => _error = 'Could not play recording: $e');
-      });
+    _open();
+  }
+
+  Future<void> _open() async {
+    try {
+      final headers = await widget.api.fileHeaders();
+      if (!mounted) return;
+      final controller = VideoPlayerController.networkUrl(
+        widget.api.fileUrl(widget.recordingId),
+        httpHeaders: headers,
+      );
+      _controller = controller;
+      await controller.initialize();
+      if (!mounted) return;
+      setState(() => _ready = true);
+      controller.play();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _error = 'Could not play recording: $e');
+    }
   }
 
   @override
   void dispose() {
-    _controller.dispose();
+    _controller?.dispose();
     super.dispose();
   }
 
@@ -168,19 +189,20 @@ class _RemotePlaybackScreenState extends State<_RemotePlaybackScreen> {
               )
             : _ready
                 ? AspectRatio(
-                    aspectRatio: _controller.value.aspectRatio,
-                    child: VideoPlayer(_controller),
+                    aspectRatio: _controller!.value.aspectRatio,
+                    child: VideoPlayer(_controller!),
                   )
                 : const CircularProgressIndicator(),
       ),
       floatingActionButton: _ready
           ? FloatingActionButton(
               onPressed: () {
+                final controller = _controller!;
                 setState(() {
-                  _controller.value.isPlaying ? _controller.pause() : _controller.play();
+                  controller.value.isPlaying ? controller.pause() : controller.play();
                 });
               },
-              child: Icon(_controller.value.isPlaying ? Icons.pause : Icons.play_arrow),
+              child: Icon(_controller!.value.isPlaying ? Icons.pause : Icons.play_arrow),
             )
           : null,
     );

@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
-import '../camera/camera_screen.dart';
-import 'camera_list_screen.dart';
+import '../auth/viewer_gate.dart';
+import '../camera/camera_gate.dart';
 import 'theme_controller.dart';
 
 /// Entry screen: choose whether this device acts as a Camera/Server or a
@@ -36,7 +36,7 @@ class ModeSelectScreen extends StatelessWidget {
                 title: 'Camera Mode',
                 subtitle: 'Turn this device into a security camera',
                 onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const CameraScreen()),
+                  MaterialPageRoute(builder: (_) => const CameraGate()),
                 ),
               ),
               const SizedBox(height: 16),
@@ -46,7 +46,7 @@ class ModeSelectScreen extends StatelessWidget {
                 subtitle: 'View and manage your cameras',
                 onTap: () => Navigator.of(context).push(
                   MaterialPageRoute(
-                    builder: (_) => CameraListScreen(themeController: themeController),
+                    builder: (_) => ViewerGate(themeController: themeController),
                   ),
                 ),
               ),

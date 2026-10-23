@@ -6,15 +6,20 @@ import 'package:socket_io_client/socket_io_client.dart' as io;
 /// config and the same "queue ICE candidates until the remote description is
 /// set" handling, since candidates can arrive before the offer/answer does.
 class SignalingClient {
-  /// [role] is 'camera' or 'viewer'. [extraQuery] carries role-specific
-  /// identity — a camera sends `camera_id`/`camera_name` so the server can
-  /// recognize it across reconnects and list it for viewers. Sent as query
-  /// params so they're included on every handshake, reconnects included.
-  SignalingClient(String serverUrl, {required String role, Map<String, String> extraQuery = const {}})
+  /// [auth] builds the Socket.IO `auth` payload — `{'device_token': ...}`
+  /// for a camera, `{'token': <Supabase access token>}` for a viewer. It's
+  /// re-run on every handshake, reconnects included, so a viewer always
+  /// presents a current access token rather than whichever one was live
+  /// when the socket was first created.
+  SignalingClient(String serverUrl, {required Future<Map<String, dynamic>> Function() auth})
       : socket = io.io(serverUrl, <String, dynamic>{
           'transports': ['websocket'],
           'autoConnect': false,
-          'query': {'role': role, ...extraQuery},
+          'auth': (dynamic sendConnectPacket) {
+            // An empty payload still gets sent on failure, so the server
+            // refuses with `connect_error` instead of the handshake hanging.
+            auth().catchError((Object _) => <String, dynamic>{}).then((data) => sendConnectPacket(data));
+          },
         });
 
   final io.Socket socket;
@@ -79,6 +84,12 @@ class SignalingClient {
     pc = null;
     _pendingRemoteCandidates.clear();
   }
+
+  /// The reason the server gave for refusing the connection (e.g.
+  /// `'device_revoked'`, `'unauthorized'`), or null for a plain network
+  /// error, from a `connect_error` event's payload.
+  static String? refusalReason(dynamic connectErrorData) =>
+      connectErrorData is Map ? connectErrorData['message'] as String? : null;
 
   void dispose() {
     socket.dispose();

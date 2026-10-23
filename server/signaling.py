@@ -1,0 +1,248 @@
+from flask import request
+from flask_socketio import SocketIO, disconnect
+
+import auth
+import db
+
+socketio = SocketIO()
+
+# Signaling relay between Camera devices and Viewer users: offers/answers/ICE
+# candidates are forwarded between a specific camera and whichever viewer is
+# currently watching it, with no WebRTC peer or media handling on the server
+# itself.
+#
+# Both sides authenticate in the Socket.IO `auth` payload (not query params,
+# which end up in proxy/access logs):
+# - cameras send `{'device_token': ...}` from QR pairing, which pins them to
+#   exactly one household;
+# - viewers send `{'token': <Supabase JWT>}`, and only ever see — and can
+#   only watch — cameras in households they're a member of.
+#
+# A same-device reconnect (new sid) evicts the stale slot outright: Engine.IO's
+# ping-timeout-based disconnect detection can take up to ~60s to notice a dead
+# socket, and without eviction a stale sid would linger as the camera's
+# connection and swallow signaling meant for the live one.
+#
+# This presence state is per-process, so the server must run as a single
+# instance until it moves to Redis.
+cameras = {}  # device_id -> {'sid': str, 'name': str, 'household_id': str}
+viewers = {}  # viewer_sid -> {'user_id': str, 'households': set, 'watching': device_id | None}
+
+
+def _roster(household_ids):
+    """Every paired (non-revoked) camera in the given households, online or
+    not — offline cameras stay listed so their recordings remain reachable."""
+    if not household_ids:
+        return []
+    rows = (
+        db.table('devices')
+        .select('id, name, household_id, households(name)')
+        .in_('household_id', list(household_ids))
+        .is_('revoked_at', 'null')
+        .order('created_at')
+        .execute()
+        .data
+    )
+    return [
+        {
+            'id': row['id'],
+            'name': row['name'],
+            'household_id': row['household_id'],
+            'household_name': row['households']['name'],
+            'online': row['id'] in cameras,
+        }
+        for row in rows
+    ]
+
+
+def _send_roster(viewer_sid):
+    viewer = viewers.get(viewer_sid)
+    if viewer is not None:
+        socketio.emit('cameras-list', _roster(viewer['households']), to=viewer_sid)
+
+
+def broadcast_roster(household_id):
+    for viewer_sid, viewer in list(viewers.items()):
+        if household_id in viewer['households']:
+            _send_roster(viewer_sid)
+
+
+def refresh_user_memberships(user_id):
+    """Re-reads a connected user's households (e.g. after they create one),
+    so their live roster picks up the change without a reconnect."""
+    households = auth.household_ids_of(user_id)
+    for viewer_sid, viewer in list(viewers.items()):
+        if viewer['user_id'] == user_id:
+            viewer['households'] = households
+            _send_roster(viewer_sid)
+
+
+def device_renamed(device_id, household_id, name):
+    camera = cameras.get(device_id)
+    if camera is not None:
+        camera['name'] = name
+    broadcast_roster(household_id)
+
+
+def device_revoked(device_id, household_id):
+    """Kicks a just-revoked camera off immediately rather than waiting for
+    it to reconnect; its token no longer passes `auth.device_for_token`, so
+    it can't come back."""
+    camera = cameras.pop(device_id, None)
+    if camera is not None:
+        _detach_camera(device_id, notify_viewer=True)
+        socketio.server.disconnect(camera['sid'], namespace='/')
+    broadcast_roster(household_id)
+
+
+def _set_last_seen(device_id):
+    db.table('devices').update({'last_seen_at': db.now()}).eq('id', device_id).execute()
+
+
+def _camera_id_of_sid(sid):
+    for device_id, info in cameras.items():
+        if info['sid'] == sid:
+            return device_id
+    return None
+
+
+@socketio.on('connect')
+def on_connect(auth_payload):
+    auth_payload = auth_payload or {}
+
+    if auth_payload.get('device_token'):
+        device = auth.device_for_token(auth_payload['device_token'])
+        if device is None:
+            print(f"Rejecting camera connection {request.sid}: invalid or revoked device token")
+            raise ConnectionRefusedError('device_revoked')
+
+        stale = cameras.get(device['id'])
+        if stale is not None and stale['sid'] != request.sid:
+            print(f"Evicting stale camera {device['id']} ({stale['sid']}), replaced by {request.sid}")
+            _detach_camera(device['id'], notify_viewer=True)
+            disconnect(sid=stale['sid'])
+
+        cameras[device['id']] = {'sid': request.sid, 'name': device['name'], 'household_id': device['household_id']}
+        _set_last_seen(device['id'])
+        print(f"Camera '{device['name']}' ({device['id']}) connected: {request.sid}")
+        broadcast_roster(device['household_id'])
+        return
+
+    claims = auth.verify_user_token(auth_payload.get('token'))
+    if claims is None:
+        print(f"Rejecting connection {request.sid}: missing or invalid credentials")
+        raise ConnectionRefusedError('unauthorized')
+
+    user_id = auth.ensure_user(claims)
+    viewers[request.sid] = {
+        'user_id': user_id,
+        'households': auth.household_ids_of(user_id),
+        'watching': None,
+    }
+    print(f"Viewer {user_id} connected: {request.sid}")
+    _send_roster(request.sid)
+
+
+@socketio.on('disconnect')
+def on_disconnect(*_):
+    device_id = _camera_id_of_sid(request.sid)
+    if device_id is not None:
+        camera = cameras.pop(device_id)
+        print(f"Camera '{camera['name']}' ({device_id}) disconnected: {request.sid}")
+        _detach_camera(device_id, notify_viewer=True)
+        _set_last_seen(device_id)
+        broadcast_roster(camera['household_id'])
+        return
+
+    if request.sid in viewers:
+        print(f"Viewer disconnected: {request.sid}")
+        _notify_camera_viewer_left(request.sid)
+        del viewers[request.sid]
+
+
+def _detach_camera(device_id, *, notify_viewer):
+    """Clears any viewer currently watching `device_id`, optionally telling
+    that viewer the camera is gone so it can reset its UI."""
+    for viewer_sid, viewer in viewers.items():
+        if viewer['watching'] == device_id:
+            viewer['watching'] = None
+            if notify_viewer:
+                socketio.emit('peer-left', to=viewer_sid)
+
+
+def _notify_camera_viewer_left(viewer_sid):
+    viewer = viewers.get(viewer_sid)
+    if viewer is None or viewer['watching'] is None:
+        return
+    camera = cameras.get(viewer['watching'])
+    if camera is not None:
+        socketio.emit('peer-left', to=camera['sid'])
+
+
+@socketio.on('watch-camera')
+def on_watch_camera(data):
+    viewer = viewers.get(request.sid)
+    if viewer is None:
+        return
+    device_id = (data or {}).get('camera_id')
+    camera = cameras.get(device_id)
+    # A camera outside the viewer's households gets the same answer as an
+    # offline one, so device ids can't be probed across households.
+    if camera is None or camera['household_id'] not in viewer['households']:
+        print(f"Viewer {request.sid} can't watch camera {device_id!r}: offline or not theirs")
+        socketio.emit('peer-left', to=request.sid)
+        return
+
+    # Switching cameras (or re-picking the same one) first tells whichever
+    # camera this viewer was previously watching that it left, so that
+    # camera stops streaming instead of pushing to a viewer who's moved on.
+    _notify_camera_viewer_left(request.sid)
+
+    viewer['watching'] = device_id
+    print(f"Viewer {request.sid} watching camera '{camera['name']}' ({device_id})")
+    socketio.emit('peer-joined', to=camera['sid'])
+
+
+@socketio.on('stop-watching')
+def on_stop_watching():
+    viewer = viewers.get(request.sid)
+    if viewer is None:
+        return
+    _notify_camera_viewer_left(request.sid)
+    viewer['watching'] = None
+
+
+def _relay_to_paired_peer(event, data):
+    device_id = _camera_id_of_sid(request.sid)
+    if device_id is not None:
+        # Sender is a camera: relay to whichever viewer is currently
+        # watching it (at most one, since each camera streams to a single
+        # viewer at a time).
+        for viewer_sid, viewer in viewers.items():
+            if viewer['watching'] == device_id:
+                socketio.emit(event, data, to=viewer_sid)
+        return
+
+    viewer = viewers.get(request.sid)
+    if viewer is not None and viewer['watching'] is not None:
+        camera = cameras.get(viewer['watching'])
+        if camera is not None:
+            socketio.emit(event, data, to=camera['sid'])
+
+
+@socketio.on('offer')
+def on_offer(data):
+    print(f"Relaying offer from {request.sid}")
+    _relay_to_paired_peer('offer', data)
+
+
+@socketio.on('answer')
+def on_answer(data):
+    print(f"Relaying answer from {request.sid}")
+    _relay_to_paired_peer('answer', data)
+
+
+@socketio.on('icecandidate')
+def on_icecandidate(data):
+    print(f"Relaying ICE candidate from {request.sid}")
+    _relay_to_paired_peer('icecandidate', data)

@@ -3,6 +3,7 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 import '../recording/camera_recordings_screen.dart';
 import '../recording/recording_manager.dart';
+import '../recording/recordings_api.dart';
 import '../recording/recordings_screen.dart';
 import '../webrtc/signaling_client.dart';
 import 'camera_list_screen.dart';
@@ -16,12 +17,16 @@ class ViewerScreen extends StatefulWidget {
     super.key,
     required this.signaling,
     required this.camera,
-    required this.serverUrl,
+    required this.recordingsApi,
+    required this.canManage,
   });
 
   final SignalingClient signaling;
   final CameraInfo camera;
-  final String serverUrl;
+  final RecordingsApi recordingsApi;
+
+  /// Whether this user can delete the camera's uploaded recordings.
+  final bool canManage;
 
   @override
   State<ViewerScreen> createState() => _ViewerScreenState();
@@ -193,9 +198,10 @@ class _ViewerScreenState extends State<ViewerScreen> {
             onPressed: () => Navigator.of(context).push(
               MaterialPageRoute(
                 builder: (_) => CameraRecordingsScreen(
-                  serverUrl: widget.serverUrl,
+                  api: widget.recordingsApi,
                   cameraId: widget.camera.id,
                   cameraName: widget.camera.name,
+                  canDelete: widget.canManage,
                 ),
               ),
             ),
