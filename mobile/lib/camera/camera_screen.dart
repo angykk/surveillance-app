@@ -2,20 +2,20 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../api/api_client.dart';
+import '../api/motion_api.dart';
 import '../config.dart';
 import '../motion/motion_detector.dart';
-import '../recording/recording_manager.dart';
-import '../recording/recordings_api.dart';
-import '../recording/recordings_screen.dart';
 import '../webrtc/signaling_client.dart';
 import 'device_credentials.dart';
 
 class CameraScreen extends StatefulWidget {
-  const CameraScreen({super.key, required this.credentials, required this.onUnpaired});
+  const CameraScreen({super.key, required this.credentials, required this.onUnpaired, required this.onSwitchMode});
 
   final DeviceCredentials credentials;
 
@@ -23,6 +23,10 @@ class CameraScreen extends StatefulWidget {
   /// removed from its household in Viewer Mode — so the caller can clear
   /// the stale credentials and return to pairing.
   final VoidCallback onUnpaired;
+
+  /// Stops the camera and returns to the mode picker. There's deliberately
+  /// no back button: an unattended camera shouldn't be one tap from off.
+  final VoidCallback onSwitchMode;
 
   @override
   State<CameraScreen> createState() => _CameraScreenState();
@@ -33,38 +37,41 @@ enum _Status { initializing, ready, permissionDenied, error }
 /// How often a frame is grabbed from the local track and checked for motion.
 const _motionCheckInterval = Duration(seconds: 1);
 
-/// Once motion stops, keep recording for this long before cutting the clip —
-/// covers brief gaps so a single event isn't split into several tiny files.
-const _recordingCooldown = Duration(seconds: 8);
+/// Once motion stops, wait this long before reporting it ended — covers
+/// brief gaps so one stretch of movement isn't split into several events.
+const _motionCooldown = Duration(seconds: 8);
 
 class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver {
   final _localRenderer = RTCVideoRenderer();
-  final _recordingManager = RecordingManager();
   final _motionDetector = MotionDetector();
-  late final _recordingsApi = RecordingsApi(
-    ApiClient.forDevice(AppConfig.serverUrl, widget.credentials.token),
-  );
+  late final _motionApi = MotionApi(ApiClient.forDevice(AppConfig.serverUrl, widget.credentials.token));
   late final SignalingClient _signaling;
   late DeviceCredentials _credentials = widget.credentials;
 
   MediaStream? _localStream;
-  MediaRecorder? _mediaRecorder;
-  File? _currentRecordingFile;
   Timer? _motionTimer;
   bool _motionCheckInFlight = false;
   DateTime? _lastMotionAt;
 
   _Status _status = _Status.initializing;
-  String _viewerStatus = 'Connecting to signaling server…';
+  /// Shown over the preview only while the server can't be reached; when
+  /// all is well the screen just shows the feed (plus LIVE while streaming).
+  String? _connectionProblem;
   String? _errorMessage;
   bool _permissionPermanentlyDenied = false;
   bool _isLiveToViewer = false;
-  bool _isRecording = false;
+  bool _motionActive = false;
+  _Clip? _clip;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // A camera phone sits on a shelf or mount sideways, and viewers lay the
+    // feed out as a horizontal video, so this screen only runs in landscape,
+    // full-screen.
+    SystemChrome.setPreferredOrientations([DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     _connectSignaling();
     _setup();
   }
@@ -78,13 +85,13 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _signaling = SignalingClient(AppConfig.serverUrl, auth: () async => {'device_token': token});
 
     _signaling.socket.on('connect', (_) {
-      if (mounted) setState(() => _viewerStatus = 'Waiting for a viewer…');
+      if (mounted) setState(() => _connectionProblem = null);
     });
     _signaling.socket.on('connect_error', (data) {
       if (SignalingClient.refusalReason(data) == 'device_revoked') {
         widget.onUnpaired();
       } else if (mounted) {
-        setState(() => _viewerStatus = 'Can\'t reach the server — retrying…');
+        setState(() => _connectionProblem = 'Can\'t reach the server — retrying…');
       }
     });
     _signaling.socket.on('peer-joined', (_) => _startStreamingToViewer());
@@ -138,6 +145,57 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     if (newName != null && newName.trim().isNotEmpty) await _renameCamera(newName);
   }
 
+  Future<void> _showSettings() async {
+    final action = await showModalBottomSheet<_SettingsAction>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.edit_outlined),
+              title: const Text('Rename camera'),
+              onTap: () => Navigator.of(context).pop(_SettingsAction.rename),
+            ),
+            ListTile(
+              leading: const Icon(Icons.swap_horiz),
+              title: const Text('Stop camera & switch mode'),
+              onTap: () => Navigator.of(context).pop(_SettingsAction.switchMode),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    switch (action) {
+      case _SettingsAction.rename:
+        await _showRenameDialog();
+      case _SettingsAction.switchMode:
+        await _confirmSwitchMode();
+      case null:
+        break;
+    }
+  }
+
+  Future<void> _confirmSwitchMode() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Stop this camera?'),
+        content: const Text(
+          'This phone will stop streaming and recording motion, and go back to the mode picker. '
+          'It stays paired, so choosing Camera Mode again picks up where it left off.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.of(context).pop(true), child: const Text('Stop camera')),
+        ],
+      ),
+    );
+    if (confirmed == true) widget.onSwitchMode();
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
@@ -188,9 +246,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   }
 
   /// Grabs a still frame off the local track and runs it through the motion
-  /// detector, independent of whether a viewer is connected — this is what
-  /// lets Camera Mode record on its own. Skips a tick rather than queuing if
-  /// the previous check (frame capture + OpenCV) hasn't finished yet.
+  /// detector, independent of whether a viewer is connected. Each stretch of
+  /// motion is reported to the server and recorded as a clip, for the
+  /// viewers' timeline. Skips a tick rather than queuing if the previous
+  /// check (frame capture + OpenCV) hasn't finished yet.
   Future<void> _checkForMotion() async {
     if (_motionCheckInFlight) return;
     final stream = _localStream;
@@ -203,11 +262,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
       if (motionDetected) {
         _lastMotionAt = DateTime.now();
-        if (!_isRecording) await _startMotionRecording();
-      } else if (_isRecording) {
+        if (!_motionActive) await _startMotion();
+      } else if (_motionActive) {
         final last = _lastMotionAt;
-        if (last != null && DateTime.now().difference(last) >= _recordingCooldown) {
-          await _stopMotionRecording();
+        if (last != null && DateTime.now().difference(last) >= _motionCooldown) {
+          await _endMotion();
         }
       }
     } catch (_) {
@@ -217,42 +276,53 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
   }
 
-  Future<void> _startMotionRecording() async {
+  /// Reports motion to the server and records a clip of it. The event id the
+  /// clip belongs to comes back in `motion-start`'s ack, long before the clip
+  /// is finished.
+  Future<void> _startMotion() async {
     final stream = _localStream;
-    if (stream == null || _isRecording) return;
+    if (stream == null || _motionActive) return;
+    setState(() => _motionActive = true);
 
-    final file = await _recordingManager.newRecordingFile();
-    final recorder = MediaRecorder();
-    await recorder.start(
-      file.path,
+    final dir = await getTemporaryDirectory();
+    final clip = _Clip(File('${dir.path}/motion-${DateTime.now().millisecondsSinceEpoch}.mp4'));
+    _clip = clip;
+    _signaling.socket.emitWithAck('motion-start', null, ack: (data) {
+      if (data is Map) clip.eventId = data['id'] as String?;
+    });
+    await clip.recorder.start(
+      clip.file.path,
       videoTrack: stream.getVideoTracks()[0],
       audioChannel: RecorderAudioChannel.INPUT,
     );
-    _mediaRecorder = recorder;
-    _currentRecordingFile = file;
-    if (mounted) setState(() => _isRecording = true);
   }
 
-  Future<void> _stopMotionRecording() async {
-    await _mediaRecorder?.stop();
-    _mediaRecorder = null;
-    if (mounted) setState(() => _isRecording = false);
+  Future<void> _endMotion() async {
+    if (!_motionActive) return;
+    _signaling.socket.emit('motion-end');
+    if (mounted) setState(() => _motionActive = false);
 
-    final file = _currentRecordingFile;
-    _currentRecordingFile = null;
-    if (file != null) _uploadRecording(file);
+    final clip = _clip;
+    _clip = null;
+    if (clip == null) return;
+    await clip.recorder.stop();
+    _uploadClip(clip);
   }
 
-  /// Pushes a finished clip to the server so Viewer Mode can browse it, on
-  /// top of the local copy `RecordingManager` already keeps — the local copy
-  /// stays put either way, so a failed/offline upload never loses the clip,
-  /// it just means it's only visible in this device's own Recordings list
-  /// until the next successful upload.
-  Future<void> _uploadRecording(File file) async {
+  /// Best-effort: a clip whose upload fails, or whose event id never arrived
+  /// (e.g. the socket was down when motion started), is dropped, and its
+  /// event just shows in the timeline without one. The local file is only a
+  /// staging copy, so it's removed either way.
+  Future<void> _uploadClip(_Clip clip) async {
     try {
-      await _recordingsApi.uploadRecording(file);
+      final eventId = clip.eventId;
+      if (eventId != null) await _motionApi.uploadClip(eventId, clip.file);
     } catch (e) {
-      debugPrint('Recording upload failed, keeping local copy only: $e');
+      debugPrint('Clip upload failed: $e');
+    } finally {
+      try {
+        await clip.file.delete();
+      } catch (_) {}
     }
   }
 
@@ -269,16 +339,12 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     final offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     signaling.socket.emit('offer', {'sdp': offer.sdp, 'type': offer.type});
-    if (mounted) setState(() => _viewerStatus = 'Viewer connected — streaming');
   }
 
   Future<void> _stopStreamingToViewer() async {
     await _signaling.resetConnection();
     if (mounted) {
-      setState(() {
-        _isLiveToViewer = false;
-        _viewerStatus = 'Waiting for a viewer…';
-      });
+      setState(() => _isLiveToViewer = false);
     }
   }
 
@@ -301,7 +367,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   Future<void> _teardown() async {
     _motionTimer?.cancel();
     _motionTimer = null;
-    if (_isRecording) await _stopMotionRecording();
+    if (_motionActive) await _endMotion();
     await _signaling.resetConnection();
     _signaling.socket.disconnect();
     // Detach the renderer before disposing the stream it's showing — doing
@@ -328,6 +394,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     _motionDetector.dispose();
     _localRenderer.dispose();
     _teardown();
@@ -337,28 +405,70 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
   @override
   Widget build(BuildContext context) {
-    final title = _status == _Status.ready
-        ? '${_credentials.name} — $_viewerStatus'
-        : _credentials.name;
+    final ready = _status == _Status.ready;
     return Scaffold(
-      appBar: AppBar(
-        title: Text(title),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.edit_outlined),
-            tooltip: 'Rename camera',
-            onPressed: _showRenameDialog,
-          ),
-          IconButton(
-            icon: const Icon(Icons.video_library_outlined),
-            tooltip: 'Recordings',
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const RecordingsScreen()),
+      backgroundColor: Colors.black,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          _buildBody(),
+          // Controls float over the full-bleed preview; SafeArea keeps them
+          // clear of a landscape notch or camera cutout.
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      _OverlayButton(icon: Icons.settings_outlined, tooltip: 'Settings', onPressed: _showSettings),
+                      const SizedBox(width: 8),
+                      Flexible(
+                        child: _Pill(
+                          child: Text(
+                            _credentials.name,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ),
+                      if (ready && _isLiveToViewer) ...[
+                        const SizedBox(width: 8),
+                        const _Pill(
+                          icon: Icon(Icons.wifi_tethering, color: Colors.greenAccent, size: 14),
+                          child: Text(
+                            'LIVE',
+                            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ],
+                      if (ready && _connectionProblem != null) ...[
+                        const SizedBox(width: 8),
+                        Flexible(
+                          child: _Pill(
+                            icon: const Icon(Icons.cloud_off, color: Colors.white70, size: 14),
+                            child: Text(_connectionProblem!, style: const TextStyle(color: Colors.white70)),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                  const Spacer(),
+                  if (ready && _motionActive)
+                    const _Pill(
+                      icon: Icon(Icons.directions_run, color: Colors.orangeAccent, size: 14),
+                      child: Text(
+                        'MOTION · REC',
+                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                ],
+              ),
             ),
           ),
         ],
       ),
-      body: _buildBody(),
     );
   }
 
@@ -382,66 +492,61 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           onRetry: _setup,
         );
       case _Status.ready:
-        return Stack(
-          fit: StackFit.expand,
-          children: [
-            RTCVideoView(
-              _localRenderer,
-              mirror: false,
-              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-            ),
-            if (_isRecording)
-              const Positioned(top: 16, left: 16, child: _RecIndicator()),
-            if (_isLiveToViewer)
-              const Positioned(top: 16, right: 16, child: _LiveIndicator()),
-          ],
-        );
+        return RTCVideoView(_localRenderer, mirror: false, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover);
     }
   }
 }
 
-class _RecIndicator extends StatelessWidget {
-  const _RecIndicator();
+enum _SettingsAction { rename, switchMode }
+
+/// A clip being recorded for one motion event.
+class _Clip {
+  _Clip(this.file);
+
+  final File file;
+  final recorder = MediaRecorder();
+
+  /// Set from the server's `motion-start` ack; null until then.
+  String? eventId;
+}
+
+/// A translucent rounded label for text over the camera preview.
+class _Pill extends StatelessWidget {
+  const _Pill({required this.child, this.icon});
+
+  final Widget child;
+  final Widget? icon;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: Colors.black54,
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: const Row(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(20)),
+      child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.circle, color: Colors.red, size: 12),
-          SizedBox(width: 6),
-          Text('MOTION · REC', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+          if (icon != null) ...[icon!, const SizedBox(width: 6)],
+          Flexible(child: child),
         ],
       ),
     );
   }
 }
 
-class _LiveIndicator extends StatelessWidget {
-  const _LiveIndicator();
+class _OverlayButton extends StatelessWidget {
+  const _OverlayButton({required this.icon, required this.tooltip, required this.onPressed});
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onPressed;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: Colors.black54,
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: const Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.wifi_tethering, color: Colors.greenAccent, size: 14),
-          SizedBox(width: 6),
-          Text('LIVE', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-        ],
-      ),
+    return IconButton.filled(
+      style: IconButton.styleFrom(backgroundColor: Colors.black54, foregroundColor: Colors.white),
+      icon: Icon(icon),
+      tooltip: tooltip,
+      onPressed: onPressed,
     );
   }
 }
@@ -461,15 +566,20 @@ class _MessageView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Scrollable because a landscape phone has little height to spare.
     return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(24, 72, 24, 24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(icon, size: 48, color: Colors.grey),
             const SizedBox(height: 16),
-            Text(message, textAlign: TextAlign.center),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white),
+            ),
             if (onRetry != null) ...[
               const SizedBox(height: 16),
               ElevatedButton(onPressed: onRetry, child: Text(retryLabel)),

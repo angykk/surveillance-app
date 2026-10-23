@@ -1,56 +1,57 @@
 import 'package:flutter/material.dart';
 
-import '../auth/viewer_gate.dart';
-import '../camera/camera_gate.dart';
-import 'theme_controller.dart';
+import 'app_mode_controller.dart';
 
 /// Entry screen: choose whether this device acts as a Camera/Server or a
-/// Viewer/Client.
+/// Viewer/Client. Shown only until a mode is chosen; the choice persists,
+/// and switching later goes through that mode's settings.
 class ModeSelectScreen extends StatelessWidget {
-  const ModeSelectScreen({super.key, required this.themeController});
+  const ModeSelectScreen({super.key, required this.onSelected});
 
-  /// Only handed to Viewer Mode below — Camera Mode runs unattended as a
-  /// fixed video feed, so a theme toggle has nothing to offer there.
-  final ThemeController themeController;
+  final ValueChanged<AppMode> onSelected;
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Repurposed Security Camera')),
+      // Scrollable and width-capped so it still fits a phone in landscape.
       body: Center(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.security, size: 64),
-              const SizedBox(height: 8),
-              const Text(
-                'Choose how this device should be used',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 16),
-              ),
-              const SizedBox(height: 32),
-              _ModeCard(
-                icon: Icons.videocam,
-                title: 'Camera Mode',
-                subtitle: 'Turn this device into a security camera',
-                onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const CameraGate()),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 480),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.security, size: 64),
+                const SizedBox(height: 8),
+                const Text(
+                  'Choose how this device should be used',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 16),
                 ),
-              ),
-              const SizedBox(height: 16),
-              _ModeCard(
-                icon: Icons.smartphone,
-                title: 'Viewer Mode',
-                subtitle: 'View and manage your cameras',
-                onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => ViewerGate(themeController: themeController),
-                  ),
+                const SizedBox(height: 4),
+                Text(
+                  'You can switch later from settings.',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall,
                 ),
-              ),
-            ],
+                const SizedBox(height: 32),
+                _ModeCard(
+                  icon: Icons.videocam,
+                  title: 'Camera Mode',
+                  subtitle: 'Turn this device into a security camera',
+                  onTap: () => onSelected(AppMode.camera),
+                ),
+                const SizedBox(height: 16),
+                _ModeCard(
+                  icon: Icons.smartphone,
+                  title: 'Viewer Mode',
+                  subtitle: 'View and manage your cameras',
+                  onTap: () => onSelected(AppMode.viewer),
+                ),
+              ],
+            ),
           ),
         ),
       ),

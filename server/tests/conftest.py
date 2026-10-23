@@ -63,9 +63,9 @@ def pair_camera(client, user_id, name='Front Door', household_id=None):
     return client.post('/devices/pair', json={'code': code, 'name': name}).get_json()
 
 
-def upload_clip(client, device_token, data=b'fake mp4 bytes'):
+def upload_clip(client, device_token, event_id, data=b'fake mp4 bytes'):
     return client.post(
-        '/recordings',
+        f'/motion-events/{event_id}/clip',
         headers=as_device(device_token),
         data={'file': (io.BytesIO(data), 'clip.mp4')},
         content_type='multipart/form-data',

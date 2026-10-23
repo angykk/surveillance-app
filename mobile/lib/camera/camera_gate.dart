@@ -8,7 +8,10 @@ import 'pair_camera_screen.dart';
 /// household, otherwise walks through pairing first. Also where a camera
 /// lands if it's removed from its household while running.
 class CameraGate extends StatefulWidget {
-  const CameraGate({super.key});
+  const CameraGate({super.key, required this.onSwitchMode});
+
+  /// Leaves Camera Mode for the mode picker.
+  final VoidCallback onSwitchMode;
 
   @override
   State<CameraGate> createState() => _CameraGateState();
@@ -49,6 +52,7 @@ class _CameraGateState extends State<CameraGate> {
     if (credentials == null) {
       return PairCameraScreen(
         notice: _notice,
+        onSwitchMode: widget.onSwitchMode,
         onPaired: (c) => setState(() {
           _credentials = c;
           _notice = null;
@@ -59,6 +63,7 @@ class _CameraGateState extends State<CameraGate> {
       key: ValueKey(credentials.deviceId),
       credentials: credentials,
       onUnpaired: _onUnpaired,
+      onSwitchMode: widget.onSwitchMode,
     );
   }
 }

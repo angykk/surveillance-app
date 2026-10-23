@@ -5,7 +5,7 @@ from flask import Flask
 
 import db
 import households
-import recordings
+import motion
 import signaling
 from sqlite_client import SQLiteClient
 
@@ -15,8 +15,8 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
 def create_app(overrides=None):
     """Builds the app from environment config (see .env.example).
 
-    `overrides` lets tests swap in a temp database/recordings dir and a test
-    JWT secret without touching the environment."""
+    `overrides` lets tests swap in a temp database/clips dir and a test JWT
+    secret without touching the environment."""
     app = Flask(__name__)
     app.config.update(
         # `or` rather than a get() default, so a blank line in .env still
@@ -51,7 +51,7 @@ def create_app(overrides=None):
     os.makedirs(app.config['RECORDINGS_DIR'], exist_ok=True)
 
     app.register_blueprint(households.bp)
-    app.register_blueprint(recordings.bp)
+    app.register_blueprint(motion.bp)
 
     # The mobile app isn't a browser, so CORS only matters for a future web
     # client; it's closed unless origins are listed explicitly.

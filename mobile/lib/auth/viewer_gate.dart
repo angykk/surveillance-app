@@ -10,9 +10,12 @@ import 'sign_in_screen.dart';
 /// screen otherwise. Rebuilds on every auth state change, so signing out
 /// from the camera list (or a session expiring for good) lands back here.
 class ViewerGate extends StatelessWidget {
-  const ViewerGate({super.key, required this.themeController});
+  const ViewerGate({super.key, required this.themeController, required this.onSwitchMode});
 
   final ThemeController themeController;
+
+  /// Leaves Viewer Mode for the mode picker.
+  final VoidCallback onSwitchMode;
 
   @override
   Widget build(BuildContext context) {
@@ -20,12 +23,13 @@ class ViewerGate extends StatelessWidget {
       stream: supabase.auth.onAuthStateChange,
       builder: (context, _) {
         final session = supabase.auth.currentSession;
-        if (session == null) return const SignInScreen();
+        if (session == null) return SignInScreen(onSwitchMode: onSwitchMode);
         // Keyed by user, so switching accounts tears down the previous
         // user's socket and roster instead of reusing them.
         return CameraListScreen(
           key: ValueKey(session.user.id),
           themeController: themeController,
+          onSwitchMode: onSwitchMode,
         );
       },
     );

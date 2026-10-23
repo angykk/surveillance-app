@@ -23,20 +23,26 @@ socketio = SocketIO()
 # socket, and without eviction a stale sid would linger as the camera's
 # connection and swallow signaling meant for the live one.
 #
+# Cameras also report motion (`motion-start` / `motion-end`), which is stored
+# as a motion event and pushed live to the household's viewers as `motion`.
+# `motion-start` acks with the event id, which the camera later uploads that
+# event's clip against (see motion.py).
+#
 # This presence state is per-process, so the server must run as a single
 # instance until it moves to Redis.
-cameras = {}  # device_id -> {'sid': str, 'name': str, 'household_id': str}
+cameras = {}  # device_id -> {'sid': str, 'name': str, 'household_id': str, 'motion_event_id': str | None}
 viewers = {}  # viewer_sid -> {'user_id': str, 'households': set, 'watching': device_id | None}
 
 
 def _roster(household_ids):
     """Every paired (non-revoked) camera in the given households, online or
-    not — offline cameras stay listed so their recordings remain reachable."""
+    not — offline cameras stay listed so their motion history remains
+    reachable."""
     if not household_ids:
         return []
     rows = (
         db.table('devices')
-        .select('id, name, household_id, households(name)')
+        .select('id, name, household_id, last_seen_at, households(name)')
         .in_('household_id', list(household_ids))
         .is_('revoked_at', 'null')
         .order('created_at')
@@ -50,6 +56,7 @@ def _roster(household_ids):
             'household_id': row['household_id'],
             'household_name': row['households']['name'],
             'online': row['id'] in cameras,
+            'last_seen_at': row['last_seen_at'],
         }
         for row in rows
     ]
@@ -61,10 +68,13 @@ def _send_roster(viewer_sid):
         socketio.emit('cameras-list', _roster(viewer['households']), to=viewer_sid)
 
 
+def _household_viewer_sids(household_id):
+    return [sid for sid, viewer in list(viewers.items()) if household_id in viewer['households']]
+
+
 def broadcast_roster(household_id):
-    for viewer_sid, viewer in list(viewers.items()):
-        if household_id in viewer['households']:
-            _send_roster(viewer_sid)
+    for viewer_sid in _household_viewer_sids(household_id):
+        _send_roster(viewer_sid)
 
 
 def refresh_user_memberships(user_id):
@@ -90,6 +100,7 @@ def device_revoked(device_id, household_id):
     it can't come back."""
     camera = cameras.pop(device_id, None)
     if camera is not None:
+        _end_motion(device_id, camera)
         _detach_camera(device_id, notify_viewer=True)
         socketio.server.disconnect(camera['sid'], namespace='/')
     broadcast_roster(household_id)
@@ -119,10 +130,16 @@ def on_connect(auth_payload):
         stale = cameras.get(device['id'])
         if stale is not None and stale['sid'] != request.sid:
             print(f"Evicting stale camera {device['id']} ({stale['sid']}), replaced by {request.sid}")
+            _end_motion(device['id'], stale)
             _detach_camera(device['id'], notify_viewer=True)
             disconnect(sid=stale['sid'])
 
-        cameras[device['id']] = {'sid': request.sid, 'name': device['name'], 'household_id': device['household_id']}
+        cameras[device['id']] = {
+            'sid': request.sid,
+            'name': device['name'],
+            'household_id': device['household_id'],
+            'motion_event_id': None,
+        }
         _set_last_seen(device['id'])
         print(f"Camera '{device['name']}' ({device['id']}) connected: {request.sid}")
         broadcast_roster(device['household_id'])
@@ -149,6 +166,7 @@ def on_disconnect(*_):
     if device_id is not None:
         camera = cameras.pop(device_id)
         print(f"Camera '{camera['name']}' ({device_id}) disconnected: {request.sid}")
+        _end_motion(device_id, camera)
         _detach_camera(device_id, notify_viewer=True)
         _set_last_seen(device_id)
         broadcast_roster(camera['household_id'])
@@ -246,3 +264,63 @@ def on_answer(data):
 def on_icecandidate(data):
     print(f"Relaying ICE candidate from {request.sid}")
     _relay_to_paired_peer('icecandidate', data)
+
+
+def serialize_motion_event(row):
+    return {
+        'id': row['id'],
+        'camera_id': row['device_id'],
+        'started_at': row['started_at'],
+        'ended_at': row['ended_at'],
+        'has_clip': row.get('clip_filename') is not None,
+    }
+
+
+def broadcast_motion(row):
+    event = serialize_motion_event(row)
+    for viewer_sid in _household_viewer_sids(row['household_id']):
+        socketio.emit('motion', event, to=viewer_sid)
+
+
+def _end_motion(device_id, camera):
+    """Closes the camera's open motion event, if any. Also runs when a camera
+    drops off, so an event is never left "ongoing" forever."""
+    event_id = camera.get('motion_event_id')
+    if event_id is None:
+        return
+    camera['motion_event_id'] = None
+    row = db.first(
+        db.table('motion_events').update({'ended_at': db.now()}).eq('id', event_id).is_('ended_at', 'null').execute()
+    )
+    if row is not None:
+        print(f"Motion ended on camera '{camera['name']}' ({device_id})")
+        broadcast_motion(row)
+
+
+@socketio.on('motion-start')
+def on_motion_start():
+    device_id = _camera_id_of_sid(request.sid)
+    if device_id is None:
+        return
+    camera = cameras[device_id]
+    if camera['motion_event_id'] is not None:
+        return {'id': camera['motion_event_id']}
+
+    row = db.first(db.table('motion_events').insert({
+        'id': db.new_id(),
+        'device_id': device_id,
+        'household_id': camera['household_id'],
+        'started_at': db.now(),
+        'ended_at': None,
+    }).execute())
+    camera['motion_event_id'] = row['id']
+    print(f"Motion started on camera '{camera['name']}' ({device_id})")
+    broadcast_motion(row)
+    return {'id': row['id']}
+
+
+@socketio.on('motion-end')
+def on_motion_end():
+    device_id = _camera_id_of_sid(request.sid)
+    if device_id is not None:
+        _end_motion(device_id, cameras[device_id])

@@ -47,19 +47,19 @@ create table if not exists pairing_codes (
   expires_at real not null,
   used_at real
 );
-create table if not exists recordings (
+create table if not exists motion_events (
   id text primary key,
   device_id text not null references devices (id) on delete cascade,
   household_id text not null references households (id) on delete cascade,
-  filename text not null,
-  created_at real not null,
-  size_bytes integer not null
+  started_at real not null,
+  ended_at real,
+  clip_filename text,
+  clip_size_bytes integer
 );
 '''
 
 # (table, embedded table) -> the foreign key column on `table`.
 _FOREIGN_KEYS = {
-    ('recordings', 'devices'): 'device_id',
     ('devices', 'households'): 'household_id',
 }
 

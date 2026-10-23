@@ -3,9 +3,8 @@ import 'package:flutter/material.dart';
 import '../api/api_client.dart';
 import '../api/households_api.dart';
 import '../auth/session.dart';
+import '../api/motion_api.dart';
 import '../config.dart';
-import '../recording/camera_recordings_screen.dart';
-import '../recording/recordings_api.dart';
 import '../webrtc/signaling_client.dart';
 import 'pairing_code_screen.dart';
 import 'theme_controller.dart';
@@ -18,6 +17,7 @@ class CameraInfo {
     required this.householdId,
     required this.householdName,
     required this.online,
+    required this.lastSeenAt,
   });
 
   final String id;
@@ -26,12 +26,18 @@ class CameraInfo {
   final String householdName;
   final bool online;
 
+  /// When the camera last connected or disconnected; null if it never has.
+  final DateTime? lastSeenAt;
+
   factory CameraInfo.fromJson(Map<dynamic, dynamic> json) => CameraInfo(
         id: json['id'] as String,
         name: json['name'] as String,
         householdId: json['household_id'] as String,
         householdName: json['household_name'] as String,
         online: json['online'] as bool,
+        lastSeenAt: json['last_seen_at'] == null
+            ? null
+            : DateTime.fromMillisecondsSinceEpoch(((json['last_seen_at'] as num) * 1000).round()),
       );
 }
 
@@ -41,9 +47,12 @@ class CameraInfo {
 /// [ViewerScreen] that reuses this same socket rather than opening a new
 /// connection, so switching cameras doesn't mean a full reconnect.
 class CameraListScreen extends StatefulWidget {
-  const CameraListScreen({super.key, required this.themeController});
+  const CameraListScreen({super.key, required this.themeController, required this.onSwitchMode});
 
   final ThemeController themeController;
+
+  /// Leaves Viewer Mode for the mode picker.
+  final VoidCallback onSwitchMode;
 
   @override
   State<CameraListScreen> createState() => _CameraListScreenState();
@@ -53,7 +62,7 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
   late final SignalingClient _signaling;
   late final _api = ApiClient.forUser(AppConfig.serverUrl);
   late final _householdsApi = HouseholdsApi(_api);
-  late final _recordingsApi = RecordingsApi(_api);
+  late final _motionApi = MotionApi(_api);
 
   List<CameraInfo> _cameras = [];
   Map<String, Household> _households = {};
@@ -130,22 +139,13 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
   bool _canManage(CameraInfo camera) => _households[camera.householdId]?.canManage ?? false;
 
   Future<void> _openCamera(CameraInfo camera) async {
-    // Offline cameras can't stream, but their uploaded clips are still on
-    // the server — go straight to those.
-    final screen = camera.online
-        ? ViewerScreen(
-            signaling: _signaling,
-            camera: camera,
-            recordingsApi: _recordingsApi,
-            canManage: _canManage(camera),
-          )
-        : CameraRecordingsScreen(
-            api: _recordingsApi,
-            cameraId: camera.id,
-            cameraName: camera.name,
-            canDelete: _canManage(camera),
-          );
-    await Navigator.of(context).push(MaterialPageRoute(builder: (_) => screen));
+    // Offline cameras open the same screen: their motion timeline is still
+    // there, and the stream starts once they come back.
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ViewerScreen(signaling: _signaling, camera: camera, motionApi: _motionApi),
+      ),
+    );
   }
 
   Future<void> _addCamera() async {
@@ -209,8 +209,7 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
       builder: (context) => AlertDialog(
         title: Text('Remove ${camera.name}?'),
         content: const Text(
-          'It will be disconnected right away and must be paired again to rejoin. '
-          'Its uploaded recordings are kept.',
+          'It will be disconnected right away and must be paired again to rejoin.',
         ),
         actions: [
           TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
@@ -233,6 +232,21 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
     }
   }
 
+  Future<void> _confirmSwitchMode() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Switch modes?'),
+        content: const Text('This device will stop being a viewer and go back to the mode picker. You\'ll stay signed in.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.of(context).pop(true), child: const Text('Switch')),
+        ],
+      ),
+    );
+    if (confirmed == true) widget.onSwitchMode();
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -242,16 +256,41 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
 
   @override
   Widget build(BuildContext context) {
-    final showHouseholds = _cameras.map((c) => c.householdId).toSet().length > 1;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Cameras'),
         actions: [
           _ThemeModeMenu(themeController: widget.themeController),
-          IconButton(
-            icon: const Icon(Icons.logout),
-            tooltip: 'Sign out ${supabase.auth.currentUser?.email ?? ''}'.trim(),
-            onPressed: () => supabase.auth.signOut(),
+          PopupMenuButton<_SettingsAction>(
+            icon: const Icon(Icons.settings_outlined),
+            tooltip: 'Settings',
+            onSelected: (action) {
+              switch (action) {
+                case _SettingsAction.signOut:
+                  supabase.auth.signOut();
+                case _SettingsAction.switchMode:
+                  _confirmSwitchMode();
+              }
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(
+                value: _SettingsAction.signOut,
+                child: ListTile(
+                  leading: const Icon(Icons.logout),
+                  title: const Text('Sign out'),
+                  subtitle: supabase.auth.currentUser?.email == null ? null : Text(supabase.auth.currentUser!.email!),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              const PopupMenuItem(
+                value: _SettingsAction.switchMode,
+                child: ListTile(
+                  leading: Icon(Icons.swap_horiz),
+                  title: Text('Switch mode'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -275,45 +314,62 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
                       icon: Icons.videocam_off_outlined,
                       message: 'No cameras yet.\nTap “Add camera”, then scan the code from a phone in Camera Mode.',
                     )
-                  : ListView.builder(
-                      padding: const EdgeInsets.fromLTRB(12, 8, 12, 88),
-                      itemCount: _cameras.length,
-                      itemBuilder: (context, index) {
-                        final camera = _cameras[index];
-                        // Names are user-chosen, so two cameras can still
-                        // share one — fall back to a short id so they're
-                        // distinguishable here.
-                        final isAmbiguous = _cameras
-                                .where((c) => c.name == camera.name && c.householdId == camera.householdId)
-                                .length >
-                            1;
-                        final status = [
-                          camera.online ? 'Online' : 'Offline',
-                          if (showHouseholds) camera.householdName,
-                          if (isAmbiguous) 'ID ${camera.id.substring(0, 8)}',
-                        ].join(' · ');
-                        return Card(
-                          margin: const EdgeInsets.symmetric(vertical: 6),
-                          child: ListTile(
-                            contentPadding: const EdgeInsets.only(left: 16, right: 4, top: 4, bottom: 4),
-                            leading: _CameraLeadingIcon(online: camera.online),
-                            title: Text(camera.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                            subtitle: Text(status),
-                            trailing: _canManage(camera)
-                                ? PopupMenuButton<String>(
-                                    onSelected: (action) =>
-                                        action == 'rename' ? _renameCamera(camera) : _removeCamera(camera),
-                                    itemBuilder: (context) => const [
-                                      PopupMenuItem(value: 'rename', child: Text('Rename')),
-                                      PopupMenuItem(value: 'remove', child: Text('Remove camera')),
-                                    ],
-                                  )
-                                : const Icon(Icons.chevron_right),
-                            onTap: () => _openCamera(camera),
-                          ),
-                        );
-                      },
-                    ),
+                  : _buildCameras(context),
+    );
+  }
+
+  /// A list in portrait; a grid of the same cards when the screen is wide
+  /// (landscape or a tablet), so they don't stretch across the whole width.
+  Widget _buildCameras(BuildContext context) {
+    const padding = EdgeInsets.fromLTRB(12, 8, 12, 88);
+    if (MediaQuery.sizeOf(context).width >= 600) {
+      return GridView.builder(
+        padding: padding,
+        gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+          maxCrossAxisExtent: 420,
+          mainAxisExtent: 88,
+          crossAxisSpacing: 8,
+        ),
+        itemCount: _cameras.length,
+        itemBuilder: (context, index) => _cameraCard(_cameras[index]),
+      );
+    }
+    return ListView.builder(
+      padding: padding,
+      itemCount: _cameras.length,
+      itemBuilder: (context, index) => _cameraCard(_cameras[index]),
+    );
+  }
+
+  Widget _cameraCard(CameraInfo camera) {
+    final showHouseholds = _cameras.map((c) => c.householdId).toSet().length > 1;
+    // Names are user-chosen, so two cameras can still share one — fall back
+    // to a short id so they're distinguishable here.
+    final isAmbiguous =
+        _cameras.where((c) => c.name == camera.name && c.householdId == camera.householdId).length > 1;
+    final status = [
+      camera.online ? 'Online' : 'Offline',
+      if (showHouseholds) camera.householdName,
+      if (isAmbiguous) 'ID ${camera.id.substring(0, 8)}',
+    ].join(' · ');
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      child: ListTile(
+        contentPadding: const EdgeInsets.only(left: 16, right: 4, top: 4, bottom: 4),
+        leading: _CameraLeadingIcon(online: camera.online),
+        title: Text(camera.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+        subtitle: Text(status),
+        trailing: _canManage(camera)
+            ? PopupMenuButton<String>(
+                onSelected: (action) => action == 'rename' ? _renameCamera(camera) : _removeCamera(camera),
+                itemBuilder: (context) => const [
+                  PopupMenuItem(value: 'rename', child: Text('Rename')),
+                  PopupMenuItem(value: 'remove', child: Text('Remove camera')),
+                ],
+              )
+            : const Icon(Icons.chevron_right),
+        onTap: () => _openCamera(camera),
+      ),
     );
   }
 }
@@ -345,7 +401,7 @@ class _CenteredMessage extends StatelessWidget {
 }
 
 /// A camera icon with a small status dot: green while the camera is
-/// connected, grey while it's offline (its recordings are still reachable).
+/// connected, grey while it's offline (its motion history is still reachable).
 class _CameraLeadingIcon extends StatelessWidget {
   const _CameraLeadingIcon({required this.online});
 
@@ -379,6 +435,8 @@ class _CameraLeadingIcon extends StatelessWidget {
 /// AppBar action for picking the app's light/dark/system theme. Lives on
 /// Viewer Mode's screens only — Camera Mode runs unattended, so there's no
 /// one around to appreciate a theme switch there.
+enum _SettingsAction { signOut, switchMode }
+
 class _ThemeModeMenu extends StatelessWidget {
   const _ThemeModeMenu({required this.themeController});
 

@@ -9,8 +9,8 @@ class Household {
   /// 'owner', 'admin' or 'viewer'.
   final String role;
 
-  /// Owners and admins can add/remove/rename cameras and delete recordings;
-  /// viewers can only watch and play back.
+  /// Owners and admins can add/remove/rename cameras; viewers can only
+  /// watch.
   bool get canManage => role == 'owner' || role == 'admin';
 
   factory Household.fromJson(Map<String, dynamic> json) => Household(

@@ -2,7 +2,7 @@
 -- (SQL Editor → New query → paste → Run). Safe to re-run.
 --
 -- Everything a user can see is scoped by household: a user reaches cameras
--- and recordings only through a membership in the household that owns them.
+-- and motion events only through a membership in the household that owns them.
 -- Timestamps are Unix epoch seconds (double precision), which is what the
 -- server and mobile app exchange.
 
@@ -56,16 +56,28 @@ create table if not exists public.pairing_codes (
 create index if not exists pairing_codes_household_id_idx on public.pairing_codes (household_id);
 create index if not exists pairing_codes_created_by_idx on public.pairing_codes (created_by);
 
-create table if not exists public.recordings (
+-- One row per stretch of motion a camera saw: opened when its motion
+-- detector fires, closed (ended_at set) once it has been still for a few
+-- seconds, or when the camera disconnects. The camera records a clip of
+-- each event and uploads it once the event ends; the clip_ columns stay
+-- null until then (or for good, if the upload never arrives).
+create table if not exists public.motion_events (
   id uuid primary key,
   device_id uuid not null references public.devices (id) on delete cascade,
   household_id uuid not null references public.households (id) on delete cascade,
-  filename text not null,
-  created_at double precision not null,
-  size_bytes bigint not null
+  started_at double precision not null,
+  ended_at double precision,
+  clip_filename text,
+  clip_size_bytes bigint
 );
-create index if not exists recordings_device_id_idx on public.recordings (device_id);
-create index if not exists recordings_household_id_idx on public.recordings (household_id);
+create index if not exists motion_events_device_id_started_at_idx on public.motion_events (device_id, started_at desc);
+create index if not exists motion_events_household_id_idx on public.motion_events (household_id);
+
+-- Clips used to live in their own `recordings` table; they now belong to
+-- motion events. Projects set up before that still have the old table; drop
+-- it by hand once its clips are no longer wanted (this script never drops
+-- data on its own):
+-- drop table if exists public.recordings;
 
 -- The `public` schema is reachable through Supabase's Data API by anyone
 -- holding the publishable key, which ships inside the mobile app. RLS with
@@ -76,7 +88,7 @@ alter table public.households enable row level security;
 alter table public.memberships enable row level security;
 alter table public.devices enable row level security;
 alter table public.pairing_codes enable row level security;
-alter table public.recordings enable row level security;
+alter table public.motion_events enable row level security;
 
 -- First sign-in: creates the user row plus a default "Home" household they
 -- own, in one transaction, so a user can never end up without a household.

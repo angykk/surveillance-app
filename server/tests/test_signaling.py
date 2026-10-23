@@ -82,3 +82,46 @@ def test_new_pairing_shows_up_in_live_roster(app, client):
     assert [(c['id'], c['name'], c['online']) for c in _last(alice, 'cameras-list')] == [
         (cam['device_id'], 'Front Door', False),
     ]
+
+
+def test_motion_reaches_only_same_household_viewers(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    alice = _connect_viewer(app, 'alice')
+    bob = _connect_viewer(app, 'bob')
+    alice.get_received()
+    bob.get_received()
+
+    camera.emit('motion-start')
+    started = _last(alice, 'motion')
+    assert started['camera_id'] == cam['device_id'] and started['ended_at'] is None
+    # A repeated start while motion is ongoing doesn't open a second event.
+    camera.emit('motion-start')
+    assert _last(alice, 'motion') is None
+
+    camera.emit('motion-end')
+    ended = _last(alice, 'motion')
+    assert ended['id'] == started['id'] and ended['ended_at'] is not None
+    assert _last(bob, 'motion') is None
+
+
+def test_viewers_cannot_report_motion(app, client):
+    cam = pair_camera(client, 'alice')
+    alice = _connect_viewer(app, 'alice')
+    alice.get_received()
+    alice.emit('motion-start')
+    assert _last(alice, 'motion') is None
+    assert client.get(f"/devices/{cam['device_id']}/motion-events", headers=as_user('alice')).get_json() == []
+
+
+def test_camera_disconnect_closes_open_motion_event(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    alice = _connect_viewer(app, 'alice')
+    camera.emit('motion-start')
+    alice.get_received()
+
+    camera.disconnect()
+    assert _last(alice, 'motion')['ended_at'] is not None
+    [event] = client.get(f"/devices/{cam['device_id']}/motion-events", headers=as_user('alice')).get_json()
+    assert event['ended_at'] is not None

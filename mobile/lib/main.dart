@@ -2,7 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'auth/viewer_gate.dart';
+import 'camera/camera_gate.dart';
 import 'config.dart';
+import 'ui/app_mode_controller.dart';
 import 'ui/mode_select_screen.dart';
 import 'ui/theme_controller.dart';
 
@@ -24,17 +27,49 @@ class MainApp extends StatefulWidget {
 
 class _MainAppState extends State<MainApp> {
   final _themeController = ThemeController();
+  final _modeController = AppModeController();
+  bool _modeLoaded = false;
 
   @override
   void initState() {
     super.initState();
     _themeController.load();
+    // Waited for, so a paired camera relaunching doesn't flash the picker.
+    _modeController.load().whenComplete(() {
+      if (mounted) setState(() => _modeLoaded = true);
+    });
   }
 
   @override
   void dispose() {
     _themeController.dispose();
+    _modeController.dispose();
     super.dispose();
+  }
+
+  /// The chosen mode is the app's root rather than a pushed route, so there's
+  /// no back button out of it; switching goes through each mode's settings.
+  Widget _buildHome() {
+    if (!_modeLoaded) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    return ValueListenableBuilder<AppMode?>(
+      valueListenable: _modeController,
+      builder: (context, mode, _) {
+        switch (mode) {
+          case null:
+            return ModeSelectScreen(onSelected: _modeController.setMode);
+          case AppMode.camera:
+            return CameraGate(key: const ValueKey(AppMode.camera), onSwitchMode: _modeController.clear);
+          case AppMode.viewer:
+            return ViewerGate(
+              key: const ValueKey(AppMode.viewer),
+              themeController: _themeController,
+              onSwitchMode: _modeController.clear,
+            );
+        }
+      },
+    );
   }
 
   @override
@@ -51,7 +86,7 @@ class _MainAppState extends State<MainApp> {
             useMaterial3: true,
           ),
           themeMode: themeMode,
-          home: ModeSelectScreen(themeController: _themeController),
+          home: _buildHome(),
         );
       },
     );

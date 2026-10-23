@@ -15,6 +15,10 @@ class SignalingClient {
       : socket = io.io(serverUrl, <String, dynamic>{
           'transports': ['websocket'],
           'autoConnect': false,
+          // socket_io_client caches one socket per URL; without this a new
+          // client (e.g. after switching modes) could get back a disposed
+          // socket still carrying the previous client's auth.
+          'forceNew': true,
           'auth': (dynamic sendConnectPacket) {
             // An empty payload still gets sent on failure, so the server
             // refuses with `connect_error` instead of the handshake hanging.

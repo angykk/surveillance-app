@@ -156,10 +156,10 @@ def rename_device(device_id):
 @auth.require_user
 def revoke_device(device_id):
     """Removes a camera from its household: its token stops working
-    immediately and any live connection is dropped. Its recordings are kept,
-    still visible to the household."""
+    immediately and any live connection is dropped."""
     device = _device_or_404(device_id)
     auth.require_member(device['household_id'], roles=db.MANAGER_ROLES)
     db.table('devices').update({'revoked_at': db.now()}).eq('id', device_id).execute()
     signaling.device_revoked(device_id, device['household_id'])
     return '', 204
+

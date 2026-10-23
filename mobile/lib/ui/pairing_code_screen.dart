@@ -63,7 +63,6 @@ class _PairingCodeScreenState extends State<PairingCodeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final code = _code;
     final expired = code != null && _remaining == Duration.zero;
     final minutes = _remaining.inMinutes;
@@ -84,51 +83,62 @@ class _PairingCodeScreenState extends State<PairingCodeScreen> {
                   ],
                 )
               : code == null
-                  ? const CircularProgressIndicator()
-                  : Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          'On the phone you want to use as a camera, open Camera Mode and scan this code.',
-                          textAlign: TextAlign.center,
-                          style: theme.textTheme.bodyLarge,
-                        ),
-                        const SizedBox(height: 24),
-                        Opacity(
-                          opacity: expired ? 0.2 : 1,
-                          child: Container(
-                            // QR scanners need dark-on-light with a quiet
-                            // zone, whatever the app's theme is.
-                            color: Colors.white,
-                            padding: const EdgeInsets.all(16),
-                            child: QrImageView(data: code.qrPayload, size: 240),
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        SelectableText(
-                          '${code.code.substring(0, 4)}-${code.code.substring(4)}',
-                          style: theme.textTheme.headlineMedium?.copyWith(
-                            fontFamily: 'monospace',
-                            letterSpacing: 4,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          expired ? 'This code has expired.' : 'Expires in $minutes:$seconds · single use',
-                          style: theme.textTheme.bodySmall,
-                        ),
-                        const SizedBox(height: 24),
-                        if (expired)
-                          FilledButton(onPressed: _generate, child: const Text('New code'))
-                        else
-                          OutlinedButton(
-                            onPressed: () => Navigator.of(context).pop(),
-                            child: const Text('Done'),
-                          ),
-                      ],
-                    ),
+              ? const CircularProgressIndicator()
+              : _buildCode(context, code, expired, '$minutes:$seconds'),
         ),
       ),
     );
+  }
+
+  Widget _buildCode(BuildContext context, PairingCode code, bool expired, String remaining) {
+    final theme = Theme.of(context);
+    final qr = Opacity(
+      opacity: expired ? 0.2 : 1,
+      child: Container(
+        // QR scanners need dark-on-light with a quiet zone, whatever the
+        // app's theme is.
+        color: Colors.white,
+        padding: const EdgeInsets.all(16),
+        child: QrImageView(data: code.qrPayload, size: 240),
+      ),
+    );
+    final details = Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          'On the phone you want to use as a camera, open Camera Mode and scan this code.',
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodyLarge,
+        ),
+        const SizedBox(height: 16),
+        SelectableText(
+          '${code.code.substring(0, 4)}-${code.code.substring(4)}',
+          style: theme.textTheme.headlineMedium?.copyWith(fontFamily: 'monospace', letterSpacing: 4),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          expired ? 'This code has expired.' : 'Expires in $remaining · single use',
+          style: theme.textTheme.bodySmall,
+        ),
+        const SizedBox(height: 24),
+        if (expired)
+          FilledButton(onPressed: _generate, child: const Text('New code'))
+        else
+          OutlinedButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Done')),
+      ],
+    );
+
+    // Side by side in landscape, where stacking them wouldn't fit the height.
+    if (MediaQuery.orientationOf(context) == Orientation.landscape) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          qr,
+          const SizedBox(width: 32),
+          ConstrainedBox(constraints: const BoxConstraints(maxWidth: 320), child: details),
+        ],
+      );
+    }
+    return Column(mainAxisSize: MainAxisSize.min, children: [qr, const SizedBox(height: 24), details]);
   }
 }

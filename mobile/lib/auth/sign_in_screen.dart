@@ -8,7 +8,10 @@ import 'session.dart';
 /// which is what [ViewerGate] listens for — so this screen never navigates
 /// on its own.
 class SignInScreen extends StatefulWidget {
-  const SignInScreen({super.key});
+  const SignInScreen({super.key, required this.onSwitchMode});
+
+  /// Back to the mode picker, for someone who chose Viewer Mode by mistake.
+  final VoidCallback onSwitchMode;
 
   @override
   State<SignInScreen> createState() => _SignInScreenState();
@@ -66,7 +69,16 @@ class _SignInScreenState extends State<SignInScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(title: Text(_isSignUp ? 'Create account' : 'Sign in')),
+      appBar: AppBar(
+        title: Text(_isSignUp ? 'Create account' : 'Sign in'),
+        actions: [
+          TextButton.icon(
+            onPressed: widget.onSwitchMode,
+            icon: const Icon(Icons.swap_horiz),
+            label: const Text('Switch mode'),
+          ),
+        ],
+      ),
       body: Center(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),

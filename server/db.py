@@ -6,7 +6,7 @@ from supabase import Client, create_client
 # Data lives in the Supabase project's Postgres (schema: supabase/schema.sql),
 # reached through the supabase client over HTTPS rather than a direct
 # Postgres connection. Everything a user can see is scoped by household: a
-# user reaches cameras and recordings only through a membership in the
+# user reaches cameras and motion events only through a membership in the
 # household that owns them.
 #
 # Rows come back as plain dicts. Queries go through the Data API, so there

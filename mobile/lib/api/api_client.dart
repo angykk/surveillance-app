@@ -24,6 +24,8 @@ class ApiClient {
   final String serverUrl;
   final AuthHeaders authHeaders;
 
+  static const timeout = Duration(seconds: 15);
+
   Uri uri(String path, [Map<String, String>? query]) =>
       Uri.parse(serverUrl).replace(path: path, queryParameters: query);
 
@@ -36,7 +38,14 @@ class ApiClient {
     Map<String, String>? query,
     Object? json,
     int expectStatus = 200,
-  }) async {
+  }) {
+    // Without a timeout, an unreachable server (e.g. a stale SERVER_IP) or a
+    // stalled Supabase token refresh in [authHeaders] leaves the caller
+    // spinning indefinitely, so it covers the whole request.
+    return _send(method, path, query, json, expectStatus).timeout(timeout);
+  }
+
+  Future<dynamic> _send(String method, String path, Map<String, String>? query, Object? json, int expectStatus) async {
     final request = http.Request(method, uri(path, query))..headers.addAll(await authHeaders());
     if (json != null) {
       request.headers['Content-Type'] = 'application/json';
