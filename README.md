@@ -1,53 +1,93 @@
 # Surveillance App
 
-Turn a phone into a security camera and watch it live from another device. One phone runs in **Camera Mode** (streams video, kept in landscape, and records a clip whenever it sees motion), another runs in **Viewer Mode** (watches the live feed alongside a timeline of motion events; tap one to play its clip). A small signaling/storage server pairs the two over WebRTC and keeps the motion history and clips.
+Turn a spare phone into a security camera and watch it from another phone.
+
+- **Camera Mode:** streams live video and records a clip whenever it detects motion.
+- **Viewer Mode:** signs in, shows your cameras, and plays the live feed next to a timeline of motion events. Tap an event to play its clip.
 
 ## Structure
 
-- `mobile/` — Flutter app (Camera Mode + Viewer Mode)
-- `server/` — Flask + Socket.IO server: WebRTC signaling relay, pairing, and the motion-event/clip API
+- `mobile/`: the Flutter app, with both modes.
+- `server/`: a Flask + Socket.IO server. It handles WebRTC signaling, camera pairing, motion events and clips.
 
-## Accounts
+## 1. Supabase project
 
-Viewers sign in with [Supabase Auth](https://supabase.com/docs/guides/auth) (email + password). Each user gets a **Home** household on first sign-in; cameras are paired into a household, and a user only ever sees the cameras and motion history of households they belong to (as `owner`, `admin` or `viewer`).
+Sign-in always goes through Supabase Auth, so you need a project even for local testing.
 
-Create a Supabase project, then:
-- **Authentication → Providers:** keep Email enabled. For local testing you may want to turn off "Confirm email".
-- **SQL Editor:** run `server/supabase/schema.sql` once (safe to re-run) to create the tables.
-- **Project Settings → API Keys:** the publishable key goes in `mobile/.env`; the secret key (`sb_secret_…`) goes in `server/.env` as `SUPABASE_KEY`.
-- **Project Settings → JWT Keys:** if the project still uses the legacy JWT secret, put it in `server/.env` as `SUPABASE_JWT_SECRET`. Projects on asymmetric signing keys don't need it.
+1. Create a project at [supabase.com](https://supabase.com).
+2. **Authentication → Providers:** keep Email on. For testing, turn off "Confirm email".
+3. Note the **Project URL**, the **publishable key** (`sb_publishable_…`) and the **secret key** (`sb_secret_…`). They're under **Project Settings → API Keys**.
 
-## Server
+## 2. Server
 
 ```
 cd server
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # set SUPABASE_URL and SUPABASE_KEY
+cp .env.example .env
+```
+
+Then pick where the server keeps its data, and set `server/.env` to match.
+
+**Local testing (SQLite):** data lives in a local file. No schema step or secret key is needed.
+
+```
+SUPABASE_URL=https://<project-ref>.supabase.co
+SQLITE_PATH=data/local.db
+```
+
+**Supabase database:**
+
+1. In the project's **SQL Editor**, run `server/supabase/schema.sql`. It's safe to re-run.
+2. Set `server/.env`:
+
+   ```
+   SUPABASE_URL=https://<project-ref>.supabase.co
+   SUPABASE_KEY=sb_secret_...
+   ```
+
+   Use the secret key here, not the publishable one. Set `SUPABASE_JWT_SECRET` too if the project still uses legacy HS256 JWT signing.
+
+Start the server:
+
+```
 python web_rtc.py
 ```
 
-Runs on `0.0.0.0:5050`. Data lives in the Supabase project's Postgres, reached through the `supabase` Python client (the Data API) with the secret key. Clip files are saved under `server/data/recordings/<device_id>/`.
+It listens on `0.0.0.0:5050`. Clips are saved under `server/data/recordings/`.
 
-For local testing, set `SQLITE_PATH=data/local.db` in `server/.env` instead of `SUPABASE_KEY`: data then goes in a local SQLite file (created on startup, no schema step needed), while sign-in still goes through your Supabase project's Auth.
-
-Tests: `pip install -r requirements-dev.txt && python -m pytest`. They use the local SQLite backend (`server/sqlite_client.py`), so they don't need a project.
-
-## Mobile app
+## 3. Mobile app
 
 ```
 cd mobile
-cp .env.example .env   # set SERVER_IP, SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY
+cp .env.example .env
 flutter pub get
 flutter run
 ```
 
-1. On your phone, pick **Viewer Mode**, sign in, and tap **Add camera** to show a pairing QR code.
-2. On the camera phone, pick **Camera Mode**, name it, and scan the code. It stays paired across restarts.
-3. The camera appears in your list. Tap it to watch live and see its motion timeline; tap an event to play its clip (offline cameras show the timeline and start streaming once they're back). Owners/admins can rename or remove cameras from the list's menu.
+Set `mobile/.env` like this:
 
-## How it works
+```
+SERVER_IP=http://<your computer's LAN IP>:5050
+SUPABASE_URL=https://<project-ref>.supabase.co
+SUPABASE_PUBLISHABLE_KEY=sb_publishable_...
+```
 
-- **Viewers** authenticate with their Supabase access token; **cameras** authenticate with a device token issued at pairing (stored hashed on the server, and in the phone's secure storage). Pairing codes are single-use and expire after 10 minutes.
-- Both connect to the server over Socket.IO, presenting their credential in the handshake `auth` payload. Viewers receive a live roster of the cameras in their households; picking one sends `watch-camera`, which the server only honors for members of that camera's household. The server then relays WebRTC offer/answer/ICE messages between that pair so video streams peer-to-peer.
-- The camera detects motion locally and reports each stretch of movement (`motion-start` / `motion-end`) over its socket. The server stores these as motion events, pushes them live to the household's viewers, and serves the history at `GET /devices/<id>/motion-events`. The camera records each event and uploads the clip once it ends (`POST /motion-events/<id>/clip`, using the event id `motion-start` acks with); household members stream it from `GET /motion-events/<id>/clip`. Managing cameras requires the `owner` or `admin` role.
-- Removing a camera revokes its token and disconnects it immediately; it has to be paired again to rejoin.
+Both phones must be able to reach `SERVER_IP`. For now, put them on the same Wi-Fi as the server.
+
+## Trying it out
+
+1. **Phone A:** choose **Viewer Mode**, create an account or sign in, then tap **Add camera** to show a pairing QR code.
+2. **Phone B:** choose **Camera Mode**, name the camera, and scan the code.
+3. On phone A, tap the camera to watch it live. Wave at it, and a motion event shows up in the timeline. Its clip becomes playable a few seconds after the motion stops.
+
+Each phone remembers its mode. To change it, use **⚙ → Switch mode**.
+
+## Tests
+
+```
+cd server && pip install -r requirements-dev.txt && python -m pytest
+cd mobile && flutter analyze && flutter test
+```
+
+The server tests use the SQLite backend, so they don't need a Supabase project.
