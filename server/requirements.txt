@@ -1,5 +1,6 @@
 Flask==3.1.0
 Flask-SocketIO==5.4.1
 supabase==2.33.0
+livekit-api==1.2.2
 PyJWT[crypto]>=2.9,<3
 python-dotenv>=1.0,<2

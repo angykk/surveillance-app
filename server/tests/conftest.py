@@ -4,20 +4,34 @@ import time
 import jwt
 import pytest
 
+import livekit_rooms
 import signaling
 from web_rtc import create_app
 
 TEST_SECRET = 'test-secret-at-least-32-bytes-long!!'
+LIVEKIT_SECRET = 'livekit-test-secret-at-least-32-bytes'
 
 
 @pytest.fixture
-def app(tmp_path):
+def closed_rooms(monkeypatch):
+    """Records `livekit_rooms.close_room` calls instead of contacting a
+    LiveKit server."""
+    closed = []
+    monkeypatch.setattr(livekit_rooms, 'close_room', closed.append)
+    return closed
+
+
+@pytest.fixture
+def app(tmp_path, closed_rooms):
     signaling.cameras.clear()
     signaling.viewers.clear()
     app = create_app({
         'SQLITE_PATH': str(tmp_path / 'test.db'),
         'RECORDINGS_DIR': str(tmp_path / 'recordings'),
         'SUPABASE_JWT_SECRET': TEST_SECRET,
+        'LIVEKIT_URL': 'ws://livekit.test:7880',
+        'LIVEKIT_API_KEY': 'devkey',
+        'LIVEKIT_API_SECRET': LIVEKIT_SECRET,
         'TESTING': True,
     })
     yield app

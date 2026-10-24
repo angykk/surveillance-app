@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:intl/intl.dart';
+import 'package:livekit_client/livekit_client.dart';
 import 'package:video_player/video_player.dart';
 
 import '../api/motion_api.dart';
@@ -14,7 +14,9 @@ const _timelinePanelWidth = 320.0;
 /// Watches a single camera over an already-connected [SignalingClient] that
 /// the caller (CameraListScreen) owns — this screen pairs with `camera` via
 /// a `watch-camera` event rather than opening its own socket, so switching
-/// cameras doesn't mean reconnecting to the server each time.
+/// cameras doesn't mean reconnecting to the server each time. The server
+/// answers with a grant for the camera's LiveKit room, which carries the
+/// video itself.
 ///
 /// The feed is horizontal (cameras run in landscape), so in portrait it sits
 /// at the top as a 16:9 panel with the camera's motion timeline below; in
@@ -35,10 +37,14 @@ class ViewerScreen extends StatefulWidget {
 }
 
 class _ViewerScreenState extends State<ViewerScreen> {
-  final _remoteRenderer = RTCVideoRenderer();
-
   late CameraInfo _camera = widget.camera;
-  MediaStream? _remoteStream;
+
+  /// The camera's LiveKit room while watching, and the tracks it's sending.
+  Room? _room;
+  EventsListener<RoomEvent>? _roomListener;
+  VideoTrack? _videoTrack;
+  RemoteAudioTrack? _audioTrack;
+
   String _status = 'Connecting…';
   bool _isLive = false;
 
@@ -67,15 +73,12 @@ class _ViewerScreenState extends State<ViewerScreen> {
   late final void Function(dynamic) _onConnect;
   late final void Function(dynamic) _onDisconnect;
   late final void Function(dynamic) _onPeerLeft;
-  late final void Function(dynamic) _onOffer;
   late final void Function(dynamic) _onRoster;
   late final void Function(dynamic) _onMotion;
 
   @override
   void initState() {
     super.initState();
-    _remoteRenderer.initialize();
-
     _onConnect = (_) {
       if (_camera.online) _watchCamera();
     };
@@ -85,15 +88,12 @@ class _ViewerScreenState extends State<ViewerScreen> {
     // Fires when the *camera* disconnects while this viewer stays connected
     // to the signaling server.
     _onPeerLeft = (_) => _resetToWaiting(_camera.online ? '${_camera.name} disconnected' : _offlineStatus());
-    _onOffer = _handleOffer;
     _onRoster = _handleRoster;
     _onMotion = _handleMotion;
 
     _signaling.socket.on('connect', _onConnect);
     _signaling.socket.on('disconnect', _onDisconnect);
     _signaling.socket.on('peer-left', _onPeerLeft);
-    _signaling.socket.on('offer', _onOffer);
-    _signaling.socket.on('icecandidate', _signaling.addRemoteIceCandidate);
     _signaling.socket.on('cameras-list', _onRoster);
     _signaling.socket.on('motion', _onMotion);
 
@@ -110,7 +110,68 @@ class _ViewerScreenState extends State<ViewerScreen> {
   void _watchCamera() {
     _watching = true;
     setState(() => _status = 'Waiting for ${_camera.name}…');
-    _signaling.socket.emit('watch-camera', {'camera_id': _camera.id});
+    _signaling.socket.emitWithAck('watch-camera', {'camera_id': _camera.id}, ack: (data) {
+      // No grant means the camera can't be watched; `peer-left` handles that.
+      final grant = StreamGrant.fromJson(data);
+      if (grant != null && mounted && _watching) _joinRoom(grant);
+    });
+  }
+
+  Future<void> _joinRoom(StreamGrant grant) async {
+    await _leaveRoom();
+    final room = Room();
+    final listener = room.createListener()
+      ..on<TrackSubscribedEvent>((event) {
+        if (_room != room || !mounted) return;
+        final track = event.track;
+        if (track is VideoTrack) {
+          setState(() {
+            _videoTrack = track;
+            _isLive = true;
+            _status = 'Live';
+          });
+        } else if (track is RemoteAudioTrack) {
+          _audioTrack = track;
+          _setLiveAudio(_clipEvent == null);
+        }
+      })
+      // The camera stopped publishing but may still be around (e.g.
+      // reconnecting); `peer-left` covers it going away for good.
+      ..on<TrackUnsubscribedEvent>((event) {
+        if (_room != room || !mounted || event.track != _videoTrack) return;
+        setState(() {
+          _videoTrack = null;
+          _isLive = false;
+          _status = 'Waiting for ${_camera.name}…';
+        });
+      })
+      // E.g. LiveKit unreachable, or the room closed because the camera
+      // was removed.
+      ..on<RoomDisconnectedEvent>((_) {
+        if (_room == room) _resetToWaiting('Live stream disconnected');
+      });
+    _room = room;
+    _roomListener = listener;
+
+    try {
+      await room.connect(grant.url, grant.token);
+    } catch (e) {
+      debugPrint('Joining LiveKit room failed: $e');
+      if (_room == room) _resetToWaiting('Could not connect to the live stream');
+    }
+  }
+
+  /// Leaves the camera's room, if in one, without touching the UI.
+  Future<void> _leaveRoom() async {
+    final room = _room;
+    final listener = _roomListener;
+    _room = null;
+    _roomListener = null;
+    _videoTrack = null;
+    _audioTrack = null;
+    await listener?.dispose();
+    await room?.disconnect();
+    await room?.dispose();
   }
 
   void _retry() {
@@ -205,9 +266,9 @@ class _ViewerScreenState extends State<ViewerScreen> {
   /// The live stream keeps running under a clip, so going back is instant;
   /// this keeps its audio from talking over the clip's.
   void _setLiveAudio(bool enabled) {
-    for (final track in _remoteStream?.getAudioTracks() ?? const <MediaStreamTrack>[]) {
-      track.enabled = enabled;
-    }
+    final track = _audioTrack;
+    if (track == null) return;
+    enabled ? track.enable() : track.disable();
   }
 
   static List<MotionEvent> _upsert(List<MotionEvent> events, MotionEvent event) =>
@@ -218,56 +279,20 @@ class _ViewerScreenState extends State<ViewerScreen> {
     return lastSeen == null ? 'Offline' : 'Offline · last seen ${_timeAgo(lastSeen)}';
   }
 
-  /// Drops any stale peer connection and returns to the waiting state, so a
+  /// Leaves the camera's room and returns to the waiting state, so a
   /// disconnect never leaves the viewer stuck on a frozen frame.
   Future<void> _resetToWaiting(String status) async {
     _watching = false;
-    // Detach the renderer from the stream *before* closing the peer
-    // connection below — closing it invalidates the remote stream's native
-    // tracks, and detaching from an already-invalidated stream is what
-    // throws "Got exception for RTCVideoRenderer::setSrcObject: null".
-    _clearRenderer();
-    _remoteStream = null;
-    await _signaling.resetConnection();
     if (mounted) {
+      // Take the video off screen before the room (and its track) goes.
       setState(() {
+        _videoTrack = null;
         _isLive = false;
         _status = status;
       });
+      await WidgetsBinding.instance.endOfFrame;
     }
-  }
-
-  /// The renderer can already be disposed by the time an async disconnect
-  /// handler gets here (e.g. the widget was torn down mid-teardown), which
-  /// makes the plain `srcObject` setter throw synchronously — swallow that
-  /// rather than crash on what's just a redundant cleanup.
-  void _clearRenderer() {
-    if (!mounted) return;
-    try {
-      _remoteRenderer.srcObject = null;
-    } catch (_) {}
-  }
-
-  Future<void> _handleOffer(dynamic data) async {
-    final pc = await _signaling.createConnection();
-
-    pc.onTrack = (RTCTrackEvent event) {
-      if (event.track.kind != 'video' || event.streams.isEmpty) return;
-      setState(() {
-        _remoteStream = event.streams.first;
-        _remoteRenderer.srcObject = _remoteStream;
-        _setLiveAudio(_clipEvent == null);
-        _isLive = true;
-        _status = 'Live';
-      });
-    };
-
-    await pc.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
-    await _signaling.flushPendingIceCandidates();
-
-    final answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    _signaling.socket.emit('answer', {'sdp': answer.sdp, 'type': answer.type});
+    await _leaveRoom();
   }
 
   @override
@@ -275,22 +300,19 @@ class _ViewerScreenState extends State<ViewerScreen> {
     _signaling.socket.off('connect', _onConnect);
     _signaling.socket.off('disconnect', _onDisconnect);
     _signaling.socket.off('peer-left', _onPeerLeft);
-    _signaling.socket.off('offer', _onOffer);
-    _signaling.socket.off('icecandidate', _signaling.addRemoteIceCandidate);
     _signaling.socket.off('cameras-list', _onRoster);
     _signaling.socket.off('motion', _onMotion);
     if (_signaling.socket.connected) {
       _signaling.socket.emit('stop-watching');
     }
-    _signaling.resetConnection();
-    _remoteRenderer.dispose();
+    _leaveRoom();
     _clipPlayer?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    // The State (and so the peer connection and renderer) is the same in
+    // The State (and so the LiveKit room) is the same in
     // both layouts, so rotating never interrupts the stream.
     return OrientationBuilder(
       builder: (context, orientation) =>
@@ -354,8 +376,8 @@ class _ViewerScreenState extends State<ViewerScreen> {
               bottom: landscape,
               child: _ClipView(controller: _clipPlayer),
             )
-          else if (_isLive)
-            RTCVideoView(_remoteRenderer, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain)
+          else if (_isLive && _videoTrack != null)
+            VideoTrackRenderer(_videoTrack!, fit: VideoViewFit.contain, mirrorMode: VideoViewMirrorMode.off)
           else
             _VideoPlaceholder(
               status: _status,
@@ -377,45 +399,53 @@ class _ViewerScreenState extends State<ViewerScreen> {
                       onPressed: () => Navigator.of(context).maybePop(),
                     ),
                     const SizedBox(width: 8),
-                    Flexible(
-                      child: _Pill(
-                        child: Text(
-                          _camera.name,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
                   ],
-                  if (_clipEvent != null) ...[
-                    _Pill(
-                      icon: const Icon(Icons.history, color: Colors.white, size: 14),
-                      child: Text(
-                        'Clip · ${DateFormat.jm().format(_clipEvent!.startedAt)}',
-                        style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                      ),
+                  // The pills wrap onto a second line rather than overflow
+                  // when they don't fit beside the buttons, e.g. a clip
+                  // playing during motion on a narrow portrait screen.
+                  Expanded(
+                    child: Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        if (landscape)
+                          _Pill(
+                            child: Text(
+                              _camera.name,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        if (_clipEvent != null)
+                          _Pill(
+                            icon: const Icon(Icons.history, color: Colors.white, size: 14),
+                            child: Text(
+                              'Clip · ${DateFormat.jm().format(_clipEvent!.startedAt)}',
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                            ),
+                          )
+                        else if (_isLive)
+                          const _Pill(
+                            icon: Icon(Icons.circle, color: Colors.redAccent, size: 10),
+                            child: Text(
+                              'LIVE',
+                              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        if (_motionNow)
+                          const _Pill(
+                            icon: PulsingDot(color: Colors.orange, size: 10),
+                            child: Text(
+                              'Motion now',
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                      ],
                     ),
-                    const SizedBox(width: 8),
-                  ] else if (_isLive) ...[
-                    const _Pill(
-                      icon: Icon(Icons.circle, color: Colors.redAccent, size: 10),
-                      child: Text(
-                        'LIVE',
-                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                  ],
-                  if (_motionNow)
-                    const _Pill(
-                      icon: PulsingDot(color: Colors.orange, size: 10),
-                      child: Text(
-                        'Motion now',
-                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                      ),
-                    ),
-                  const Spacer(),
+                  ),
+                  const SizedBox(width: 8),
                   if (_clipEvent != null) ...[
                     FilledButton.icon(
                       style: FilledButton.styleFrom(backgroundColor: Colors.black54, foregroundColor: Colors.white),

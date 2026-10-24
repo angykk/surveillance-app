@@ -1,5 +1,7 @@
+import jwt
+
 import signaling
-from conftest import as_user, pair_camera, user_token
+from conftest import LIVEKIT_SECRET, as_user, pair_camera, user_token
 
 
 def _connect_viewer(app, user_id):
@@ -13,6 +15,19 @@ def _connect_camera(app, device_token):
 def _last(client, event):
     matches = [m for m in client.get_received() if m['name'] == event]
     return matches[-1]['args'][0] if matches and matches[-1]['args'] else (matches[-1] if matches else None)
+
+
+def _names(client):
+    return [m['name'] for m in client.get_received()]
+
+
+def _video_grant(grant):
+    assert grant['url'] == 'ws://livekit.test:7880'
+    return jwt.decode(grant['token'], LIVEKIT_SECRET, algorithms=['HS256'])['video']
+
+
+def _watch(viewer, device_id):
+    return viewer.emit('watch-camera', {'camera_id': device_id}, callback=True)
 
 
 def test_unauthenticated_sockets_are_refused(app):
@@ -39,31 +54,71 @@ def test_viewer_cannot_watch_another_households_camera(app, client):
     bob_camera.get_received()
 
     mallory = _connect_viewer(app, 'mallory')
-    mallory.emit('watch-camera', {'camera_id': bob_cam['device_id']})
-    assert any(m['name'] == 'peer-left' for m in mallory.get_received())
-    # The camera was never asked to start streaming, and relayed signaling
-    # from the outsider goes nowhere.
-    mallory.emit('offer', {'sdp': 'x', 'type': 'offer'})
-    assert [m['name'] for m in bob_camera.get_received()] == []
+    mallory.get_received()
+    assert not _watch(mallory, bob_cam['device_id'])
+    assert _names(mallory) == ['peer-left']
+    # The camera was never asked to start streaming.
+    assert _names(bob_camera) == []
 
 
-def test_member_can_watch_and_relay(app, client):
+def test_watching_hands_out_scoped_livekit_grants(app, client):
     cam = pair_camera(client, 'alice')
     camera = _connect_camera(app, cam['device_token'])
     alice = _connect_viewer(app, 'alice')
     camera.get_received()
-    alice.get_received()
 
-    alice.emit('watch-camera', {'camera_id': cam['device_id']})
-    assert [m['name'] for m in camera.get_received()] == ['peer-joined']
+    viewer_grant = _video_grant(_watch(alice, cam['device_id']))
+    assert viewer_grant['room'] == cam['device_id']
+    assert viewer_grant['canSubscribe'] is True
+    assert viewer_grant['canPublish'] is False
+    assert viewer_grant['canPublishData'] is False
 
-    camera.emit('offer', {'sdp': 'v=0', 'type': 'offer'})
-    assert _last(alice, 'offer') == {'sdp': 'v=0', 'type': 'offer'}
-    alice.emit('answer', {'sdp': 'v=0', 'type': 'answer'})
-    assert _last(camera, 'answer') == {'sdp': 'v=0', 'type': 'answer'}
+    camera_grant = _video_grant(_last(camera, 'stream-start'))
+    assert camera_grant['room'] == cam['device_id']
+    assert camera_grant['canPublish'] is True
+    assert camera_grant['canSubscribe'] is False
 
 
-def test_revoking_a_device_disconnects_it_and_blocks_reconnect(app, client):
+def test_camera_streams_until_its_last_viewer_leaves(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    phone_a = _connect_viewer(app, 'alice')
+    phone_b = _connect_viewer(app, 'alice')
+    camera.get_received()
+
+    grant_a = _watch(phone_a, cam['device_id'])
+    grant_b = _watch(phone_b, cam['device_id'])
+    assert grant_a['token'] != grant_b['token']
+    # Only the first watcher starts the stream.
+    assert _names(camera) == ['stream-start']
+
+    phone_a.emit('stop-watching')
+    assert _names(camera) == []
+    phone_b.disconnect()
+    assert _names(camera) == ['stream-stop']
+
+    # Watching again restarts it.
+    _watch(phone_a, cam['device_id'])
+    assert _names(camera) == ['stream-start']
+
+
+def test_switching_cameras_releases_the_previous_one(app, client):
+    front = pair_camera(client, 'alice')
+    garage = pair_camera(client, 'alice', name='Garage')
+    front_camera = _connect_camera(app, front['device_token'])
+    garage_camera = _connect_camera(app, garage['device_token'])
+    alice = _connect_viewer(app, 'alice')
+
+    _watch(alice, front['device_id'])
+    front_camera.get_received()
+    garage_camera.get_received()
+
+    _watch(alice, garage['device_id'])
+    assert _names(front_camera) == ['stream-stop']
+    assert _names(garage_camera) == ['stream-start']
+
+
+def test_revoking_a_device_disconnects_it_and_blocks_reconnect(app, client, closed_rooms):
     cam = pair_camera(client, 'alice')
     camera = _connect_camera(app, cam['device_token'])
     alice = _connect_viewer(app, 'alice')
@@ -73,6 +128,8 @@ def test_revoking_a_device_disconnects_it_and_blocks_reconnect(app, client):
     assert not camera.is_connected()
     assert _last(alice, 'cameras-list') == []
     assert not _connect_camera(app, cam['device_token']).is_connected()
+    # Its LiveKit room is closed too, in case it ignores the disconnect.
+    assert closed_rooms == [cam['device_id']]
 
 
 def test_new_pairing_shows_up_in_live_roster(app, client):

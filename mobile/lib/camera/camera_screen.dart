@@ -3,7 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart' as rtc;
+import 'package:livekit_client/livekit_client.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -42,13 +43,25 @@ const _motionCheckInterval = Duration(seconds: 1);
 const _motionCooldown = Duration(seconds: 8);
 
 class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver {
-  final _localRenderer = RTCVideoRenderer();
   final _motionDetector = MotionDetector();
   late final _motionApi = MotionApi(ApiClient.forDevice(AppConfig.serverUrl, widget.credentials.token));
   late final SignalingClient _signaling;
   late DeviceCredentials _credentials = widget.credentials;
 
-  MediaStream? _localStream;
+  /// The camera and mic, opened once in [_setup] and shared by the preview,
+  /// motion detection, clip recording and (while watched) publishing, so
+  /// nothing has to fight over the hardware.
+  LocalVideoTrack? _videoTrack;
+  LocalAudioTrack? _audioTrack;
+
+  /// This camera's LiveKit room, joined only while someone is watching.
+  Room? _room;
+  EventsListener<RoomEvent>? _roomListener;
+
+  /// Set once [dispose] starts, so async cleanup it kicks off doesn't call
+  /// setState on a widget that's going away.
+  bool _disposed = false;
+
   Timer? _motionTimer;
   bool _motionCheckInFlight = false;
   DateTime? _lastMotionAt;
@@ -87,6 +100,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _signaling.socket.on('connect', (_) {
       if (mounted) setState(() => _connectionProblem = null);
     });
+    // The server forgets which cameras are streaming when one drops off,
+    // and viewers re-request the stream once it's back, so leave the room.
+    _signaling.socket.on('disconnect', (_) => _stopStreaming());
     _signaling.socket.on('connect_error', (data) {
       if (SignalingClient.refusalReason(data) == 'device_revoked') {
         widget.onUnpaired();
@@ -94,10 +110,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         setState(() => _connectionProblem = 'Can\'t reach the server — retrying…');
       }
     });
-    _signaling.socket.on('peer-joined', (_) => _startStreamingToViewer());
-    _signaling.socket.on('peer-left', (_) => _stopStreamingToViewer());
-    _signaling.socket.on('answer', _handleAnswer);
-    _signaling.socket.on('icecandidate', _signaling.addRemoteIceCandidate);
+    _signaling.socket.on('stream-start', (data) {
+      final grant = StreamGrant.fromJson(data);
+      if (grant != null) _startStreaming(grant);
+    });
+    _signaling.socket.on('stream-stop', (_) => _stopStreaming());
   }
 
   Future<void> _renameCamera(String newName) async {
@@ -200,7 +217,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused) {
       _teardown();
-    } else if (state == AppLifecycleState.resumed && _localStream == null) {
+    } else if (state == AppLifecycleState.resumed && _videoTrack == null) {
       _setup();
     }
   }
@@ -222,16 +239,18 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       return;
     }
 
-    await _localRenderer.initialize();
-
+    LocalVideoTrack? video;
     try {
-      final stream = await navigator.mediaDevices.getUserMedia({
-        'video': true,
-        'audio': true,
-      });
-      _localStream = stream;
-      _localRenderer.srcObject = stream;
+      video = await LocalVideoTrack.createCameraTrack(
+        // The rear lens: an unattended camera faces the room, not a person
+        // holding the phone.
+        const CameraCaptureOptions(cameraPosition: CameraPosition.back, params: VideoParametersPresets.h720_169),
+      );
+      final audio = await LocalAudioTrack.create();
+      _videoTrack = video;
+      _audioTrack = audio;
     } catch (e) {
+      await video?.stop();
       setState(() {
         _status = _Status.error;
         _errorMessage = e.toString();
@@ -252,12 +271,12 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   /// check (frame capture + OpenCV) hasn't finished yet.
   Future<void> _checkForMotion() async {
     if (_motionCheckInFlight) return;
-    final stream = _localStream;
-    if (stream == null || stream.getVideoTracks().isEmpty) return;
+    final track = _videoTrack;
+    if (track == null) return;
 
     _motionCheckInFlight = true;
     try {
-      final frame = await stream.getVideoTracks().first.captureFrame();
+      final frame = await track.mediaStreamTrack.captureFrame();
       final motionDetected = _motionDetector.detect(frame.asUint8List());
 
       if (motionDetected) {
@@ -280,8 +299,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   /// clip belongs to comes back in `motion-start`'s ack, long before the clip
   /// is finished.
   Future<void> _startMotion() async {
-    final stream = _localStream;
-    if (stream == null || _motionActive) return;
+    final track = _videoTrack;
+    if (track == null || _motionActive) return;
     setState(() => _motionActive = true);
 
     final dir = await getTemporaryDirectory();
@@ -292,15 +311,15 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     });
     await clip.recorder.start(
       clip.file.path,
-      videoTrack: stream.getVideoTracks()[0],
-      audioChannel: RecorderAudioChannel.INPUT,
+      videoTrack: track.mediaStreamTrack,
+      audioChannel: rtc.RecorderAudioChannel.INPUT,
     );
   }
 
   Future<void> _endMotion() async {
     if (!_motionActive) return;
     _signaling.socket.emit('motion-end');
-    if (mounted) setState(() => _motionActive = false);
+    if (mounted && !_disposed) setState(() => _motionActive = false);
 
     final clip = _clip;
     _clip = null;
@@ -326,39 +345,60 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
   }
 
-  Future<void> _startStreamingToViewer() async {
-    final stream = _localStream;
-    final signaling = _signaling;
-    if (stream == null) return;
+  /// Joins this camera's LiveKit room and publishes the already-running
+  /// camera and mic, once the server says someone wants to watch.
+  Future<void> _startStreaming(StreamGrant grant) async {
+    final video = _videoTrack;
+    final audio = _audioTrack;
+    if (video == null || audio == null) return;
+    await _stopStreaming();
 
-    final pc = await signaling.createConnection();
-    for (final track in stream.getTracks()) {
-      await pc.addTrack(track, stream);
+    final room = Room(
+      roomOptions: const RoomOptions(
+        // Leaving the room must not stop the tracks: the preview, motion
+        // detection and clip recording keep using them.
+        stopLocalTrackOnUnpublish: false,
+        // Simulcast would encode extra layers on the phone for no benefit
+        // with a handful of viewers.
+        defaultVideoPublishOptions: VideoPublishOptions(simulcast: false),
+      ),
+    );
+    final listener = room.createListener()
+      ..on<ParticipantConnectedEvent>((_) => _updateLive())
+      ..on<ParticipantDisconnectedEvent>((_) => _updateLive())
+      ..on<RoomDisconnectedEvent>((_) => _updateLive());
+    _room = room;
+    _roomListener = listener;
+
+    try {
+      await room.connect(grant.url, grant.token);
+      // A `stream-stop` (or teardown) may have arrived while connecting.
+      if (_room != room) return;
+      await room.localParticipant?.publishVideoTrack(video);
+      await room.localParticipant?.publishAudioTrack(audio);
+      _updateLive();
+    } catch (e) {
+      debugPrint('Joining LiveKit room failed: $e');
+      if (_room == room) await _stopStreaming();
     }
-
-    final offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    signaling.socket.emit('offer', {'sdp': offer.sdp, 'type': offer.type});
   }
 
-  Future<void> _stopStreamingToViewer() async {
-    await _signaling.resetConnection();
-    if (mounted) {
-      setState(() => _isLiveToViewer = false);
-    }
+  /// LIVE shows while at least one viewer is in the room.
+  void _updateLive() {
+    final live = _room?.remoteParticipants.isNotEmpty ?? false;
+    if (mounted && !_disposed && live != _isLiveToViewer) setState(() => _isLiveToViewer = live);
   }
 
-  Future<void> _handleAnswer(dynamic data) async {
-    final signaling = _signaling;
-    final pc = signaling.pc;
-    if (pc == null) return;
-    if (pc.signalingState != RTCSignalingState.RTCSignalingStateHaveLocalOffer) {
-      return;
-    }
-
-    await pc.setRemoteDescription(RTCSessionDescription(data['sdp'], data['type']));
-    await signaling.flushPendingIceCandidates();
-    if (mounted) setState(() => _isLiveToViewer = true);
+  /// Leaves the room (if in one). The local tracks keep running.
+  Future<void> _stopStreaming() async {
+    final room = _room;
+    final listener = _roomListener;
+    _room = null;
+    _roomListener = null;
+    _updateLive();
+    await listener?.dispose();
+    await room?.disconnect();
+    await room?.dispose();
   }
 
   /// Releases the camera and drops the signaling connection while the app is
@@ -368,36 +408,29 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _motionTimer?.cancel();
     _motionTimer = null;
     if (_motionActive) await _endMotion();
-    await _signaling.resetConnection();
+    await _stopStreaming();
     _signaling.socket.disconnect();
-    // Detach the renderer before disposing the stream it's showing — doing
-    // it the other way round throws "Got exception for
-    // RTCVideoRenderer::setSrcObject: null" trying to detach from a stream
-    // whose native tracks are already gone.
-    _clearLocalRenderer();
-    await _localStream?.dispose();
-    _localStream = null;
-    if (mounted) setState(() {});
-  }
 
-  /// The renderer can already be disposed by the time an async teardown gets
-  /// here (e.g. the widget was torn down mid-teardown), which makes the
-  /// plain `srcObject` setter throw synchronously — swallow that rather than
-  /// crash on what's just a redundant cleanup.
-  void _clearLocalRenderer() {
-    if (!mounted) return;
-    try {
-      _localRenderer.srcObject = null;
-    } catch (_) {}
+    final video = _videoTrack;
+    final audio = _audioTrack;
+    _videoTrack = null;
+    _audioTrack = null;
+    // Take the preview off screen before stopping the track it's showing.
+    if (mounted && !_disposed) {
+      setState(() {});
+      await WidgetsBinding.instance.endOfFrame;
+    }
+    await video?.stop();
+    await audio?.stop();
   }
 
   @override
   void dispose() {
+    _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     _motionDetector.dispose();
-    _localRenderer.dispose();
     _teardown();
     _signaling.dispose();
     super.dispose();
@@ -492,7 +525,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           onRetry: _setup,
         );
       case _Status.ready:
-        return RTCVideoView(_localRenderer, mirror: false, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover);
+        final track = _videoTrack;
+        if (track == null) return const SizedBox.shrink();
+        return VideoTrackRenderer(track, fit: VideoViewFit.cover, mirrorMode: VideoViewMirrorMode.off);
     }
   }
 }
@@ -504,7 +539,7 @@ class _Clip {
   _Clip(this.file);
 
   final File file;
-  final recorder = MediaRecorder();
+  final recorder = rtc.MediaRecorder();
 
   /// Set from the server's `motion-start` ack; null until then.
   String? eventId;

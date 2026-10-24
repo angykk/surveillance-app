@@ -3,13 +3,20 @@ from flask_socketio import SocketIO, disconnect
 
 import auth
 import db
+import livekit_rooms
 
 socketio = SocketIO()
 
-# Signaling relay between Camera devices and Viewer users: offers/answers/ICE
-# candidates are forwarded between a specific camera and whichever viewer is
-# currently watching it, with no WebRTC peer or media handling on the server
-# itself.
+# Control plane between Camera devices and Viewer users. Live video itself
+# goes through LiveKit (see livekit_rooms.py); this socket decides who may
+# watch what and tells cameras when to join their room:
+# - `watch-camera` is acked with a subscribe-only LiveKit grant for that
+#   camera's room, and the first watcher sends the camera `stream-start` with
+#   a publish-only grant;
+# - once the last watcher stops (or drops off), the camera gets
+#   `stream-stop` and leaves the room, so an unwatched camera doesn't keep
+#   uploading video.
+# Any number of viewers can watch one camera at once.
 #
 # Both sides authenticate in the Socket.IO `auth` payload (not query params,
 # which end up in proxy/access logs):
@@ -21,7 +28,7 @@ socketio = SocketIO()
 # A same-device reconnect (new sid) evicts the stale slot outright: Engine.IO's
 # ping-timeout-based disconnect detection can take up to ~60s to notice a dead
 # socket, and without eviction a stale sid would linger as the camera's
-# connection and swallow signaling meant for the live one.
+# connection and swallow control messages meant for the live one.
 #
 # Cameras also report motion (`motion-start` / `motion-end`), which is stored
 # as a motion event and pushed live to the household's viewers as `motion`.
@@ -30,7 +37,7 @@ socketio = SocketIO()
 #
 # This presence state is per-process, so the server must run as a single
 # instance until it moves to Redis.
-cameras = {}  # device_id -> {'sid': str, 'name': str, 'household_id': str, 'motion_event_id': str | None}
+cameras = {}  # device_id -> {'sid': str, 'name': str, 'household_id': str, 'motion_event_id': str | None, 'streaming': bool}
 viewers = {}  # viewer_sid -> {'user_id': str, 'households': set, 'watching': device_id | None}
 
 
@@ -103,6 +110,7 @@ def device_revoked(device_id, household_id):
         _end_motion(device_id, camera)
         _detach_camera(device_id, notify_viewer=True)
         socketio.server.disconnect(camera['sid'], namespace='/')
+    livekit_rooms.close_room(device_id)
     broadcast_roster(household_id)
 
 
@@ -139,6 +147,7 @@ def on_connect(auth_payload):
             'name': device['name'],
             'household_id': device['household_id'],
             'motion_event_id': None,
+            'streaming': False,
         }
         _set_last_seen(device['id'])
         print(f"Camera '{device['name']}' ({device['id']}) connected: {request.sid}")
@@ -172,10 +181,10 @@ def on_disconnect(*_):
         broadcast_roster(camera['household_id'])
         return
 
-    if request.sid in viewers:
+    viewer = viewers.pop(request.sid, None)
+    if viewer is not None:
         print(f"Viewer disconnected: {request.sid}")
-        _notify_camera_viewer_left(request.sid)
-        del viewers[request.sid]
+        _release_stream(viewer['watching'])
 
 
 def _detach_camera(device_id, *, notify_viewer):
@@ -188,20 +197,26 @@ def _detach_camera(device_id, *, notify_viewer):
                 socketio.emit('peer-left', to=viewer_sid)
 
 
-def _notify_camera_viewer_left(viewer_sid):
-    viewer = viewers.get(viewer_sid)
-    if viewer is None or viewer['watching'] is None:
+def _release_stream(device_id):
+    """Tells a camera to leave its LiveKit room once nobody is watching it
+    any more, so it isn't uploading video to an empty room."""
+    camera = cameras.get(device_id)
+    if camera is None or not camera['streaming']:
         return
-    camera = cameras.get(viewer['watching'])
-    if camera is not None:
-        socketio.emit('peer-left', to=camera['sid'])
+    if any(viewer['watching'] == device_id for viewer in viewers.values()):
+        return
+    camera['streaming'] = False
+    print(f"Camera '{camera['name']}' ({device_id}) has no viewers left; stopping stream")
+    socketio.emit('stream-stop', to=camera['sid'])
 
 
 @socketio.on('watch-camera')
 def on_watch_camera(data):
+    """Acks with a LiveKit grant for the camera's room, or nothing (plus
+    `peer-left`) if the camera can't be watched."""
     viewer = viewers.get(request.sid)
     if viewer is None:
-        return
+        return None
     device_id = (data or {}).get('camera_id')
     camera = cameras.get(device_id)
     # A camera outside the viewer's households gets the same answer as an
@@ -209,16 +224,20 @@ def on_watch_camera(data):
     if camera is None or camera['household_id'] not in viewer['households']:
         print(f"Viewer {request.sid} can't watch camera {device_id!r}: offline or not theirs")
         socketio.emit('peer-left', to=request.sid)
-        return
+        return None
 
-    # Switching cameras (or re-picking the same one) first tells whichever
-    # camera this viewer was previously watching that it left, so that
-    # camera stops streaming instead of pushing to a viewer who's moved on.
-    _notify_camera_viewer_left(request.sid)
-
+    # Switching cameras releases the previous one, so it stops streaming if
+    # this viewer was its last watcher.
+    previous = viewer['watching']
     viewer['watching'] = device_id
+    if previous != device_id:
+        _release_stream(previous)
+
     print(f"Viewer {request.sid} watching camera '{camera['name']}' ({device_id})")
-    socketio.emit('peer-joined', to=camera['sid'])
+    if not camera['streaming']:
+        camera['streaming'] = True
+        socketio.emit('stream-start', livekit_rooms.camera_grant(device_id, camera['name']), to=camera['sid'])
+    return livekit_rooms.viewer_grant(device_id, viewer['user_id'], request.sid)
 
 
 @socketio.on('stop-watching')
@@ -226,44 +245,9 @@ def on_stop_watching():
     viewer = viewers.get(request.sid)
     if viewer is None:
         return
-    _notify_camera_viewer_left(request.sid)
+    previous = viewer['watching']
     viewer['watching'] = None
-
-
-def _relay_to_paired_peer(event, data):
-    device_id = _camera_id_of_sid(request.sid)
-    if device_id is not None:
-        # Sender is a camera: relay to whichever viewer is currently
-        # watching it (at most one, since each camera streams to a single
-        # viewer at a time).
-        for viewer_sid, viewer in viewers.items():
-            if viewer['watching'] == device_id:
-                socketio.emit(event, data, to=viewer_sid)
-        return
-
-    viewer = viewers.get(request.sid)
-    if viewer is not None and viewer['watching'] is not None:
-        camera = cameras.get(viewer['watching'])
-        if camera is not None:
-            socketio.emit(event, data, to=camera['sid'])
-
-
-@socketio.on('offer')
-def on_offer(data):
-    print(f"Relaying offer from {request.sid}")
-    _relay_to_paired_peer('offer', data)
-
-
-@socketio.on('answer')
-def on_answer(data):
-    print(f"Relaying answer from {request.sid}")
-    _relay_to_paired_peer('answer', data)
-
-
-@socketio.on('icecandidate')
-def on_icecandidate(data):
-    print(f"Relaying ICE candidate from {request.sid}")
-    _relay_to_paired_peer('icecandidate', data)
+    _release_stream(previous)
 
 
 def serialize_motion_event(row):

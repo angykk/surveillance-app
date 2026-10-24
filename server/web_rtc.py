@@ -5,6 +5,7 @@ from flask import Flask
 
 import db
 import households
+import livekit_rooms
 import motion
 import signaling
 from sqlite_client import SQLiteClient
@@ -28,6 +29,12 @@ def create_app(overrides=None):
         # Keeps data in a local SQLite file instead of the Supabase project
         # (local testing). Sign-in still goes through Supabase Auth.
         SQLITE_PATH=os.environ.get('SQLITE_PATH', ''),
+        # The LiveKit server that carries live video. LIVEKIT_URL is handed
+        # to the phones as-is, so it must be reachable from them (a LAN IP or
+        # public host, not localhost).
+        LIVEKIT_URL=os.environ.get('LIVEKIT_URL', ''),
+        LIVEKIT_API_KEY=os.environ.get('LIVEKIT_API_KEY', ''),
+        LIVEKIT_API_SECRET=os.environ.get('LIVEKIT_API_SECRET', ''),
         # Caps clip uploads; Werkzeug rejects anything larger with a 413
         # before it's written to disk.
         MAX_CONTENT_LENGTH=int(os.environ.get('MAX_UPLOAD_MB', '200')) * 1024 * 1024,
@@ -47,6 +54,10 @@ def create_app(overrides=None):
         db.init_client(app.config['SUPABASE_URL'], app.config['SUPABASE_KEY'])
     else:
         raise RuntimeError('Set SUPABASE_KEY (the secret key), or SQLITE_PATH for a local database, in .env.')
+
+    if not (app.config['LIVEKIT_URL'] and app.config['LIVEKIT_API_KEY'] and app.config['LIVEKIT_API_SECRET']):
+        raise RuntimeError('Set LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET in .env for live video.')
+    livekit_rooms.init(app.config['LIVEKIT_URL'], app.config['LIVEKIT_API_KEY'], app.config['LIVEKIT_API_SECRET'])
 
     os.makedirs(app.config['RECORDINGS_DIR'], exist_ok=True)
 

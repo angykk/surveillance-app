@@ -16,6 +16,9 @@ def test_asymmetric_supabase_tokens_verify_via_jwks(tmp_path, monkeypatch):
         'RECORDINGS_DIR': str(tmp_path / 'recordings'),
         'SUPABASE_URL': SUPABASE_URL,
         'SUPABASE_JWT_SECRET': '',
+        'LIVEKIT_URL': 'ws://livekit.test:7880',
+        'LIVEKIT_API_KEY': 'devkey',
+        'LIVEKIT_API_SECRET': 'livekit-test-secret-at-least-32-bytes',
     })
     key = ec.generate_private_key(ec.SECP256R1())
     other_key = ec.generate_private_key(ec.SECP256R1())
