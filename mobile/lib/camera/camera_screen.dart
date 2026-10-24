@@ -61,6 +61,11 @@ const _eventIdTimeout = Duration(seconds: 10);
 /// retrying whenever the socket reconnects.
 const _clipRetryInterval = Duration(minutes: 2);
 
+/// The rear lens: an unattended camera faces the room, not a person holding
+/// the phone.
+const _cameraCaptureOptions =
+    CameraCaptureOptions(cameraPosition: CameraPosition.back, params: VideoParametersPresets.h720_169);
+
 class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver {
   final _motionDetector = MotionDetector();
   late final _clipQueue = ClipUploadQueue(MotionApi(ApiClient.forDevice(AppConfig.serverUrl, widget.credentials.token)));
@@ -77,6 +82,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   /// This camera's LiveKit room, joined only while someone is watching.
   Room? _room;
   EventsListener<RoomEvent>? _roomListener;
+
+  /// The last queued stream start/stop; see [_inStreamOrder].
+  Future<void> _streamOps = Future.value();
 
   /// Set once [dispose] starts, so async cleanup it kicks off doesn't call
   /// setState on a widget that's going away.
@@ -133,7 +141,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     });
     // The server forgets which cameras are streaming when one drops off,
     // and viewers re-request the stream once it's back, so leave the room.
-    _signaling.socket.on('disconnect', (_) => _stopStreaming());
+    _signaling.socket.on('disconnect', (_) => _inStreamOrder(_stopStreaming));
     _signaling.socket.on('connect_error', (data) {
       if (SignalingClient.refusalReason(data) == 'device_revoked') {
         widget.onUnpaired();
@@ -143,9 +151,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     });
     _signaling.socket.on('stream-start', (data) {
       final grant = StreamGrant.fromJson(data);
-      if (grant != null) _startStreaming(grant);
+      if (grant != null) _inStreamOrder(() => _startStreaming(grant));
     });
-    _signaling.socket.on('stream-stop', (_) => _stopStreaming());
+    _signaling.socket.on('stream-stop', (_) => _inStreamOrder(_stopStreaming));
   }
 
   Future<void> _renameCamera(String newName) async {
@@ -272,11 +280,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
     LocalVideoTrack? video;
     try {
-      video = await LocalVideoTrack.createCameraTrack(
-        // The rear lens: an unattended camera faces the room, not a person
-        // holding the phone.
-        const CameraCaptureOptions(cameraPosition: CameraPosition.back, params: VideoParametersPresets.h720_169),
-      );
+      video = await LocalVideoTrack.createCameraTrack(_cameraCaptureOptions);
       final audio = await LocalAudioTrack.create();
       _videoTrack = video;
       _audioTrack = audio;
@@ -311,7 +315,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       final ByteBuffer frame;
       try {
         frame = await track.mediaStreamTrack.captureFrame().timeout(_captureTimeout);
-      } on TimeoutException {
+      } catch (_) {
+        // A stopped track fails its grabs outright rather than timing out,
+        // and needs the same restart.
         if (++_stalledCaptures >= _stallsBeforeRestart) _restartCamera();
         return;
       }
@@ -393,6 +399,19 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
   }
 
+  /// Runs stream starts and stops one at a time, in the order they arrive.
+  /// Leaving a room takes a moment, and the old room's cleanup unpublishes
+  /// the same camera track a new room is publishing, so a viewer who backs
+  /// out and straight back in (`stream-stop` then `stream-start`) got no
+  /// video when the two overlapped.
+  Future<void> _inStreamOrder(Future<void> Function() op) {
+    final next = _streamOps.then((_) => op()).catchError((Object e) {
+      debugPrint('Stream start/stop failed: $e');
+    });
+    _streamOps = next;
+    return next;
+  }
+
   /// Joins this camera's LiveKit room and publishes the already-running
   /// camera and mic, once the server says someone wants to watch.
   Future<void> _startStreaming(StreamGrant grant) async {
@@ -437,16 +456,62 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     if (mounted && !_disposed && live != _isLiveToViewer) setState(() => _isLiveToViewer = live);
   }
 
-  /// Leaves the room (if in one). The local tracks keep running.
-  Future<void> _stopStreaming() async {
+  /// Leaves the room (if in one), then reopens the camera and mic if leaving
+  /// stopped them; [_teardown], which stops them anyway, skips that.
+  Future<void> _stopStreaming({bool reopenCamera = true}) async {
     final room = _room;
     final listener = _roomListener;
     _room = null;
     _roomListener = null;
     _updateLive();
+    if (room == null) return;
     await listener?.dispose();
-    await room?.disconnect();
-    await room?.dispose();
+    await room.disconnect();
+    await room.dispose();
+    if (reopenCamera) await _reopenCameraIfStopped();
+  }
+
+  /// Leaving a room disposes the tracks LiveKit published there, which stops
+  /// them despite `stopLocalTrackOnUnpublish: false`. Left alone, the preview
+  /// froze on its last frame, motion frame grabs failed, and the next
+  /// `stream-start` couldn't publish them ("track is null"). So swap in
+  /// freshly opened ones.
+  Future<void> _reopenCameraIfStopped() async {
+    final oldVideo = _videoTrack;
+    final oldAudio = _audioTrack;
+    if (_disposed || oldVideo == null || oldAudio == null) return;
+    if (oldVideo.isActive && oldAudio.isActive) return;
+
+    // The clip in progress was recording the old track.
+    if (_motionActive) await _endMotion();
+    _videoTrack = null;
+    _audioTrack = null;
+    // Take the preview off screen before stopping the track it's showing.
+    if (mounted) {
+      setState(() {});
+      await WidgetsBinding.instance.endOfFrame;
+    }
+    await oldVideo.stop();
+    await oldAudio.stop();
+
+    LocalVideoTrack? video;
+    try {
+      video = await LocalVideoTrack.createCameraTrack(_cameraCaptureOptions);
+      final audio = await LocalAudioTrack.create();
+      _videoTrack = video;
+      _audioTrack = audio;
+    } catch (e) {
+      await video?.stop();
+      if (mounted && !_disposed) {
+        setState(() {
+          _status = _Status.error;
+          _errorMessage = e.toString();
+        });
+      }
+      return;
+    }
+    _stalledCaptures = 0;
+    if (mounted && !_disposed) setState(() {});
   }
 
   /// Releases the camera and drops the signaling connection while the app is
@@ -456,7 +521,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _motionTimer?.cancel();
     _motionTimer = null;
     if (_motionActive) await _endMotion();
-    await _stopStreaming();
+    await _inStreamOrder(() => _stopStreaming(reopenCamera: false));
     _signaling.socket.disconnect();
 
     final video = _videoTrack;

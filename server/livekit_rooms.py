@@ -1,4 +1,5 @@
 import asyncio
+import secrets
 from datetime import timedelta
 
 from livekit import api
@@ -46,9 +47,11 @@ def camera_grant(device_id, name):
 
 
 def viewer_grant(device_id, user_id, sid):
-    """Subscribe-only. Includes the socket id so the same user can watch from
-    two phones at once (LiveKit kicks a duplicate identity)."""
-    return _grant(f'viewer:{user_id}:{sid}', 'viewer', device_id, publish=False)
+    """Subscribe-only. LiveKit kicks a duplicate identity, so each grant gets
+    its own: the socket id lets the same user watch from two phones at once,
+    and the random suffix keeps a viewer that backs out and straight back in
+    (same socket) from colliding with its own session that's still leaving."""
+    return _grant(f'viewer:{user_id}:{sid}:{secrets.token_hex(4)}', 'viewer', device_id, publish=False)
 
 
 def close_room(device_id):
