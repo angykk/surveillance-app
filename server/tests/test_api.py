@@ -1,5 +1,8 @@
+import os
 import time
 
+import db
+import retention
 import signaling
 from conftest import as_device, as_user, home_household, pair_camera, upload_clip, user_token
 
@@ -66,27 +69,99 @@ def test_motion_events_are_scoped_to_household(app, client):
     assert _motion_events(client, 'bob', alice_cam['device_id']).status_code == 404
 
 
+def _motion_event(app, camera_token):
+    camera = signaling.socketio.test_client(app, auth={'device_token': camera_token})
+    event_id = camera.emit('motion-start', callback=True)['id']
+    camera.emit('motion-end')
+    return event_id
+
+
 def test_clips_attach_to_their_own_event_and_stay_in_household(app, client):
     alice_cam = pair_camera(client, 'alice')
     bob_cam = pair_camera(client, 'bob', name='Garage')
-    camera = signaling.socketio.test_client(app, auth={'device_token': alice_cam['device_token']})
-    event_id = camera.emit('motion-start', callback=True)['id']
-    camera.emit('motion-end')
-    clip_url = f'/motion-events/{event_id}/clip'
+    event_id = _motion_event(app, alice_cam['device_token'])
+    clip_url = f'/motion-events/{event_id}/clip-url'
 
     # No clip yet.
     assert client.get(clip_url, headers=as_user('alice')).status_code == 404
     # Only the camera that saw the motion can attach its clip, and only once.
     assert upload_clip(client, bob_cam['device_token'], event_id).status_code == 404
-    assert client.post(clip_url, headers=as_user('alice')).status_code == 401
+    assert client.post(f'/motion-events/{event_id}/clip/upload', headers=as_user('alice')).status_code == 401
     assert upload_clip(client, alice_cam['device_token'], event_id).status_code == 204
     assert upload_clip(client, alice_cam['device_token'], event_id).status_code == 409
 
     [event] = _motion_events(client, 'alice', alice_cam['device_id']).get_json()
     assert event['has_clip'] is True
     resp = client.get(clip_url, headers=as_user('alice'))
-    assert resp.status_code == 200 and resp.data == b'fake mp4 bytes'
+    assert resp.status_code == 200
+    # The player streams from the signed URL itself, with no auth headers.
+    assert client.get(resp.get_json()['url']).data == b'fake mp4 bytes'
     assert client.get(clip_url, headers=as_user('bob')).status_code == 404
+
+
+def test_clip_done_needs_the_upload_and_can_be_retried(app, client):
+    cam = pair_camera(client, 'alice')
+    event_id = _motion_event(app, cam['device_token'])
+    headers = as_device(cam['device_token'])
+
+    first_url = client.post(f'/motion-events/{event_id}/clip/upload', headers=headers).get_json()['url']
+    # Nothing was uploaded, so the event can't be marked done.
+    assert client.post(f'/motion-events/{event_id}/clip/done', headers=headers).status_code == 400
+    # A retry gets a fresh URL for the same object, and the upload completes.
+    assert upload_clip(client, cam['device_token'], event_id).status_code == 204
+    assert first_url.split('?')[0] == client.get(
+        f'/motion-events/{event_id}/clip-url', headers=as_user('alice')
+    ).get_json()['url'].split('?')[0]
+
+
+def test_signed_clip_urls_only_allow_their_own_object_and_operation(app, client):
+    cam = pair_camera(client, 'alice')
+    event_id = _motion_event(app, cam['device_token'])
+    upload_url = client.post(f'/motion-events/{event_id}/clip/upload', headers=as_device(cam['device_token'])).get_json()['url']
+    path, token = upload_url.split('?t=')
+
+    # An upload URL can't be used to download, nor for another key.
+    assert client.get(upload_url).status_code == 403
+    assert client.put(path.replace(event_id, db.new_id()) + '?t=' + token, data=b'x').status_code == 403
+    assert client.put(path + '?t=forged', data=b'x').status_code == 403
+
+
+def _stored_keys(app):
+    root = app.config['RECORDINGS_DIR']
+    return sorted(
+        os.path.relpath(os.path.join(dirpath, name), root)
+        for dirpath, _, names in os.walk(root)
+        for name in names
+    )
+
+
+def test_retention_deletes_old_events_and_their_clips(app, client):
+    cam = pair_camera(client, 'alice')
+    old_event = _motion_event(app, cam['device_token'])
+    new_event = _motion_event(app, cam['device_token'])
+    for event_id in (old_event, new_event):
+        assert upload_clip(client, cam['device_token'], event_id).status_code == 204
+    db.table('motion_events').update({'started_at': db.now() - 31 * 86400}).eq('id', old_event).execute()
+
+    retention.run_once(30, app.extensions['clip_storage'])
+
+    events = _motion_events(client, 'alice', cam['device_id']).get_json()
+    assert [e['id'] for e in events] == [new_event]
+    assert [os.path.basename(k) for k in _stored_keys(app)] == [f'{new_event}.mp4']
+    assert db.table('clip_deletions').select('clip_key').execute().data == []
+
+
+def test_cascaded_deletes_still_clean_up_clips(app, client):
+    cam = pair_camera(client, 'alice')
+    event_id = _motion_event(app, cam['device_token'])
+    assert upload_clip(client, cam['device_token'], event_id).status_code == 204
+    # E.g. the user was deleted in Supabase Auth, which cascades without the
+    # server hearing about it.
+    db.table('users').delete().eq('id', 'alice').execute()
+    assert _stored_keys(app) != []
+
+    retention.run_once(0, app.extensions['clip_storage'])
+    assert _stored_keys(app) == []
 
 
 def test_revoked_device_token_stops_working(client):
@@ -123,6 +198,6 @@ def test_malformed_ids_are_not_found(client):
     # Ids are uuid columns in Postgres, which errors on anything else; these
     # must come back as a plain 404 rather than a server error.
     assert client.get('/devices/nope/motion-events', headers=as_user('alice')).status_code == 404
-    assert client.get('/motion-events/nope/clip', headers=as_user('alice')).status_code == 404
+    assert client.get('/motion-events/nope/clip-url', headers=as_user('alice')).status_code == 404
     assert client.delete('/devices/nope', headers=as_user('alice')).status_code == 404
     assert client.post('/households/nope/pairing-codes', headers=as_user('alice')).status_code == 404

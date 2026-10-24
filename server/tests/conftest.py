@@ -1,4 +1,3 @@
-import io
 import time
 
 import jwt
@@ -78,9 +77,12 @@ def pair_camera(client, user_id, name='Front Door', household_id=None):
 
 
 def upload_clip(client, device_token, event_id, data=b'fake mp4 bytes'):
-    return client.post(
-        f'/motion-events/{event_id}/clip',
-        headers=as_device(device_token),
-        data={'file': (io.BytesIO(data), 'clip.mp4')},
-        content_type='multipart/form-data',
-    )
+    """Attaches a clip the way the camera does: ask for a signed upload URL,
+    PUT the file to it, then report it done. Returns the first response that
+    isn't a success, or the final `done` response."""
+    resp = client.post(f'/motion-events/{event_id}/clip/upload', headers=as_device(device_token))
+    if resp.status_code != 200:
+        return resp
+    put = client.put(resp.get_json()['url'], data=data, content_type='video/mp4')
+    assert put.status_code == 200
+    return client.post(f'/motion-events/{event_id}/clip/done', headers=as_device(device_token))

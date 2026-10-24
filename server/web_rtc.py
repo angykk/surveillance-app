@@ -3,10 +3,12 @@ import os
 from dotenv import load_dotenv
 from flask import Flask
 
+import clip_storage
 import db
 import households
 import livekit_rooms
 import motion
+import retention
 import signaling
 from sqlite_client import SQLiteClient
 
@@ -22,7 +24,17 @@ def create_app(overrides=None):
     app.config.update(
         # `or` rather than a get() default, so a blank line in .env still
         # falls back to the default.
+        # Where clips are kept with a local SQLite database (local testing).
+        # With Supabase they go to the CLIP_BUCKET Storage bucket instead.
         RECORDINGS_DIR=os.environ.get('RECORDINGS_DIR') or os.path.join(DATA_DIR, 'recordings'),
+        CLIP_BUCKET=os.environ.get('CLIP_BUCKET') or 'clips',
+        # Signs LocalStorage's clip URLs. A random one per process is fine:
+        # cameras ask for a fresh upload URL on every try.
+        SECRET_KEY=os.environ.get('SECRET_KEY') or os.urandom(32),
+        # Motion events and their clips older than this are deleted (0 keeps
+        # them forever); checked every RETENTION_INTERVAL_S.
+        RETENTION_DAYS=int(os.environ.get('RETENTION_DAYS') or '30'),
+        RETENTION_INTERVAL_S=int(os.environ.get('RETENTION_INTERVAL_S') or '3600'),
         SUPABASE_URL=os.environ.get('SUPABASE_URL', ''),
         SUPABASE_KEY=os.environ.get('SUPABASE_KEY', ''),
         SUPABASE_JWT_SECRET=os.environ.get('SUPABASE_JWT_SECRET', ''),
@@ -35,8 +47,8 @@ def create_app(overrides=None):
         LIVEKIT_URL=os.environ.get('LIVEKIT_URL', ''),
         LIVEKIT_API_KEY=os.environ.get('LIVEKIT_API_KEY', ''),
         LIVEKIT_API_SECRET=os.environ.get('LIVEKIT_API_SECRET', ''),
-        # Caps clip uploads; Werkzeug rejects anything larger with a 413
-        # before it's written to disk.
+        # Caps request bodies, including clip uploads to LocalStorage;
+        # Werkzeug rejects anything larger with a 413.
         MAX_CONTENT_LENGTH=int(os.environ.get('MAX_UPLOAD_MB', '200')) * 1024 * 1024,
     )
     if overrides:
@@ -50,8 +62,11 @@ def create_app(overrides=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         db.use_client(SQLiteClient(path))
         print(f'Using local SQLite database {path}')
+        os.makedirs(app.config['RECORDINGS_DIR'], exist_ok=True)
+        app.extensions['clip_storage'] = clip_storage.LocalStorage(app.config['RECORDINGS_DIR'], app.config['SECRET_KEY'])
     elif app.config['SUPABASE_URL'] and app.config['SUPABASE_KEY']:
-        db.init_client(app.config['SUPABASE_URL'], app.config['SUPABASE_KEY'])
+        client = db.init_client(app.config['SUPABASE_URL'], app.config['SUPABASE_KEY'])
+        app.extensions['clip_storage'] = clip_storage.SupabaseStorage(client, app.config['CLIP_BUCKET'])
     else:
         raise RuntimeError('Set SUPABASE_KEY (the secret key), or SQLITE_PATH for a local database, in .env.')
 
@@ -59,15 +74,18 @@ def create_app(overrides=None):
         raise RuntimeError('Set LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET in .env for live video.')
     livekit_rooms.init(app.config['LIVEKIT_URL'], app.config['LIVEKIT_API_KEY'], app.config['LIVEKIT_API_SECRET'])
 
-    os.makedirs(app.config['RECORDINGS_DIR'], exist_ok=True)
-
     app.register_blueprint(households.bp)
     app.register_blueprint(motion.bp)
+    app.register_blueprint(clip_storage.bp)
 
     # The mobile app isn't a browser, so CORS only matters for a future web
     # client; it's closed unless origins are listed explicitly.
     cors_origins = [o for o in os.environ.get('CORS_ORIGINS', '').split(',') if o]
     signaling.socketio.init_app(app, async_mode='threading', cors_allowed_origins=cors_origins or None)
+
+    # Tests call retention.run_once themselves.
+    if not app.config.get('TESTING'):
+        retention.start(app)
     return app
 
 

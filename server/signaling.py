@@ -256,7 +256,7 @@ def serialize_motion_event(row):
         'camera_id': row['device_id'],
         'started_at': row['started_at'],
         'ended_at': row['ended_at'],
-        'has_clip': row.get('clip_filename') is not None,
+        'has_clip': row.get('clip_size_bytes') is not None,
     }
 
 

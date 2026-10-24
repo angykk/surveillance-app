@@ -59,15 +59,17 @@ create index if not exists pairing_codes_created_by_idx on public.pairing_codes 
 -- One row per stretch of motion a camera saw: opened when its motion
 -- detector fires, closed (ended_at set) once it has been still for a few
 -- seconds, or when the camera disconnects. The camera records a clip of
--- each event and uploads it once the event ends; the clip_ columns stay
--- null until then (or for good, if the upload never arrives).
+-- each event and uploads it to the `clips` Storage bucket once the event
+-- ends. clip_key is set when the camera asks for an upload URL, and
+-- clip_size_bytes once the upload is confirmed, which is what makes the
+-- event playable; both stay null if no upload ever arrives.
 create table if not exists public.motion_events (
   id uuid primary key,
   device_id uuid not null references public.devices (id) on delete cascade,
   household_id uuid not null references public.households (id) on delete cascade,
   started_at double precision not null,
   ended_at double precision,
-  clip_filename text,
+  clip_key text,
   clip_size_bytes bigint
 );
 create index if not exists motion_events_device_id_started_at_idx on public.motion_events (device_id, started_at desc);
@@ -79,6 +81,64 @@ create index if not exists motion_events_household_id_idx on public.motion_event
 -- data on its own):
 -- drop table if exists public.recordings;
 
+-- Projects set up before clips moved to Storage have `clip_filename`, which
+-- named a file on the server's disk. Those files aren't in the bucket, so
+-- their events lose their clips.
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'motion_events' and column_name = 'clip_filename'
+  ) then
+    alter table public.motion_events rename column clip_filename to clip_key;
+    update public.motion_events set clip_key = null, clip_size_bytes = null;
+  end if;
+end;
+$$;
+
+-- Storage keys of clips whose motion event is gone, waiting for the
+-- server's retention job to delete them from the bucket. A trigger fills
+-- it, so cascades the server never sees (a deleted household, or a user
+-- deleted in Supabase Auth) still get their clips cleaned up.
+create table if not exists public.clip_deletions (
+  clip_key text primary key,
+  queued_at double precision not null
+);
+
+-- security definer: a cascade from deleting a Supabase Auth user runs as
+-- the auth service's role, which RLS (and its grants) would otherwise stop
+-- from writing here, failing the whole user deletion.
+create or replace function public.queue_clip_deletion()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  insert into public.clip_deletions (clip_key, queued_at)
+  values (old.clip_key, extract(epoch from now()))
+  on conflict (clip_key) do nothing;
+  return old;
+end;
+$$;
+
+drop trigger if exists motion_events_queue_clip_deletion on public.motion_events;
+create trigger motion_events_queue_clip_deletion
+after delete on public.motion_events
+for each row
+when (old.clip_key is not null)
+execute function public.queue_clip_deletion();
+
+-- Trigger functions can't be called directly, but keep it off the
+-- client-facing roles like every other function here.
+revoke execute on function public.queue_clip_deletion () from public, anon, authenticated;
+
+-- The private bucket clips live in. Only the server (secret key) can reach
+-- it; cameras and viewers get short-lived signed URLs for one object each.
+insert into storage.buckets (id, name, public, allowed_mime_types)
+values ('clips', 'clips', false, array['video/mp4'])
+on conflict (id) do nothing;
+
 -- The `public` schema is reachable through Supabase's Data API by anyone
 -- holding the publishable key, which ships inside the mobile app. RLS with
 -- no policies blocks that path entirely; the server uses the secret key,
@@ -89,6 +149,7 @@ alter table public.memberships enable row level security;
 alter table public.devices enable row level security;
 alter table public.pairing_codes enable row level security;
 alter table public.motion_events enable row level security;
+alter table public.clip_deletions enable row level security;
 
 -- First sign-in: creates the user row plus a default "Home" household they
 -- own, in one transaction, so a user can never end up without a household.

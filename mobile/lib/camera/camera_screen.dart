@@ -1,18 +1,20 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart' as rtc;
 import 'package:livekit_client/livekit_client.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../api/api_client.dart';
 import '../api/motion_api.dart';
 import '../config.dart';
 import '../motion/motion_detector.dart';
 import '../webrtc/signaling_client.dart';
+import 'clip_upload_queue.dart';
 import 'device_credentials.dart';
 
 class CameraScreen extends StatefulWidget {
@@ -26,7 +28,8 @@ class CameraScreen extends StatefulWidget {
   final VoidCallback onUnpaired;
 
   /// Stops the camera and returns to the mode picker. There's deliberately
-  /// no back button: an unattended camera shouldn't be one tap from off.
+  /// no back button, and system back asks first: an unattended camera
+  /// shouldn't be one tap from off.
   final VoidCallback onSwitchMode;
 
   @override
@@ -42,9 +45,26 @@ const _motionCheckInterval = Duration(seconds: 1);
 /// brief gaps so one stretch of movement isn't split into several events.
 const _motionCooldown = Duration(seconds: 8);
 
+/// A frame capture that hasn't come back by now means the camera has stopped
+/// delivering frames (e.g. iOS paused it under thermal pressure).
+const _captureTimeout = Duration(seconds: 5);
+
+/// After this many stalled captures in a row, the camera is restarted, since
+/// a frozen camera would otherwise sit there frozen until someone notices.
+const _stallsBeforeRestart = 2;
+
+/// How long a finished clip waits for its event id (the `motion-start` ack)
+/// before it's dropped as belonging to no event.
+const _eventIdTimeout = Duration(seconds: 10);
+
+/// How often queued clips are retried while the camera runs, on top of
+/// retrying whenever the socket reconnects.
+const _clipRetryInterval = Duration(minutes: 2);
+
 class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver {
   final _motionDetector = MotionDetector();
-  late final _motionApi = MotionApi(ApiClient.forDevice(AppConfig.serverUrl, widget.credentials.token));
+  late final _clipQueue = ClipUploadQueue(MotionApi(ApiClient.forDevice(AppConfig.serverUrl, widget.credentials.token)));
+  Timer? _clipRetryTimer;
   late final SignalingClient _signaling;
   late DeviceCredentials _credentials = widget.credentials;
 
@@ -64,6 +84,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
   Timer? _motionTimer;
   bool _motionCheckInFlight = false;
+  int _stalledCaptures = 0;
+  bool _restartingCamera = false;
   DateTime? _lastMotionAt;
 
   _Status _status = _Status.initializing;
@@ -85,8 +107,15 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     // full-screen.
     SystemChrome.setPreferredOrientations([DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    // Left alone, the phone's auto-lock would sleep the screen after a
+    // minute or so, which pauses the app and stops the camera.
+    WakelockPlus.enable();
     _connectSignaling();
     _setup();
+    // Clips left over from an earlier run (e.g. the app was killed while
+    // offline) go up as soon as possible.
+    _clipQueue.drain();
+    _clipRetryTimer = Timer.periodic(_clipRetryInterval, (_) => _clipQueue.drain());
   }
 
   /// Creates the signaling socket and registers its listeners. Registered
@@ -99,6 +128,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
     _signaling.socket.on('connect', (_) {
       if (mounted) setState(() => _connectionProblem = null);
+      // Back online, so whatever piled up meanwhile can go.
+      _clipQueue.drain();
     });
     // The server forgets which cameras are streaming when one drops off,
     // and viewers re-request the stream once it's back, so leave the room.
@@ -259,6 +290,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
 
     if (!mounted) return;
+    _stalledCaptures = 0;
     setState(() => _status = _Status.ready);
     _signaling.socket.connect();
     _motionTimer = Timer.periodic(_motionCheckInterval, (_) => _checkForMotion());
@@ -276,8 +308,16 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
     _motionCheckInFlight = true;
     try {
-      final frame = await track.mediaStreamTrack.captureFrame();
-      final motionDetected = _motionDetector.detect(frame.asUint8List());
+      final ByteBuffer frame;
+      try {
+        frame = await track.mediaStreamTrack.captureFrame().timeout(_captureTimeout);
+      } on TimeoutException {
+        if (++_stalledCaptures >= _stallsBeforeRestart) _restartCamera();
+        return;
+      }
+      _stalledCaptures = 0;
+      final motionDetected = await _motionDetector.detect(frame.asUint8List());
+      if (_videoTrack != track) return;
 
       if (motionDetected) {
         _lastMotionAt = DateTime.now();
@@ -295,6 +335,20 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
   }
 
+  /// Reopens the camera after it stopped delivering frames. Tearing down ends
+  /// any open motion event and reconnects the socket, as a resume does.
+  Future<void> _restartCamera() async {
+    if (_restartingCamera || _disposed) return;
+    _restartingCamera = true;
+    debugPrint('Camera stopped delivering frames; restarting it');
+    try {
+      await _teardown();
+      if (mounted && !_disposed) await _setup();
+    } finally {
+      _restartingCamera = false;
+    }
+  }
+
   /// Reports motion to the server and records a clip of it. The event id the
   /// clip belongs to comes back in `motion-start`'s ack, long before the clip
   /// is finished.
@@ -303,11 +357,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     if (track == null || _motionActive) return;
     setState(() => _motionActive = true);
 
-    final dir = await getTemporaryDirectory();
-    final clip = _Clip(File('${dir.path}/motion-${DateTime.now().millisecondsSinceEpoch}.mp4'));
+    final clip = _Clip(await _clipQueue.newRecordingFile());
     _clip = clip;
     _signaling.socket.emitWithAck('motion-start', null, ack: (data) {
-      if (data is Map) clip.eventId = data['id'] as String?;
+      if (!clip.eventId.isCompleted) clip.eventId.complete(data is Map ? data['id'] as String? : null);
     });
     await clip.recorder.start(
       clip.file.path,
@@ -325,23 +378,18 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _clip = null;
     if (clip == null) return;
     await clip.recorder.stop();
-    _uploadClip(clip);
+    _queueClip(clip);
   }
 
-  /// Best-effort: a clip whose upload fails, or whose event id never arrived
-  /// (e.g. the socket was down when motion started), is dropped, and its
-  /// event just shows in the timeline without one. The local file is only a
-  /// staging copy, so it's removed either way.
-  Future<void> _uploadClip(_Clip clip) async {
-    try {
-      final eventId = clip.eventId;
-      if (eventId != null) await _motionApi.uploadClip(eventId, clip.file);
-    } catch (e) {
-      debugPrint('Clip upload failed: $e');
-    } finally {
-      try {
-        await clip.file.delete();
-      } catch (_) {}
+  /// Hands a finished clip to the upload queue, which keeps it until the
+  /// server has it. A clip whose event id never arrives (the socket was down
+  /// when motion started) belongs to no event, so it's dropped.
+  Future<void> _queueClip(_Clip clip) async {
+    final eventId = await clip.eventId.future.timeout(_eventIdTimeout, onTimeout: () => null);
+    if (eventId == null) {
+      await _clipQueue.discard(clip.file);
+    } else {
+      await _clipQueue.add(clip.file, eventId);
     }
   }
 
@@ -428,6 +476,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   void dispose() {
     _disposed = true;
     WidgetsBinding.instance.removeObserver(this);
+    WakelockPlus.disable();
+    _clipRetryTimer?.cancel();
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     _motionDetector.dispose();
@@ -439,68 +489,76 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   @override
   Widget build(BuildContext context) {
     final ready = _status == _Status.ready;
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          _buildBody(),
-          // Controls float over the full-bleed preview; SafeArea keeps them
-          // clear of a landscape notch or camera cutout.
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      _OverlayButton(icon: Icons.settings_outlined, tooltip: 'Settings', onPressed: _showSettings),
-                      const SizedBox(width: 8),
-                      Flexible(
-                        child: _Pill(
-                          child: Text(
-                            _credentials.name,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                          ),
-                        ),
-                      ),
-                      if (ready && _isLiveToViewer) ...[
-                        const SizedBox(width: 8),
-                        const _Pill(
-                          icon: Icon(Icons.wifi_tethering, color: Colors.greenAccent, size: 14),
-                          child: Text(
-                            'LIVE',
-                            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                          ),
-                        ),
-                      ],
-                      if (ready && _connectionProblem != null) ...[
+    return PopScope(
+      // System back would otherwise close the app and stop the camera; it
+      // asks first, like "Stop camera & switch mode" in settings.
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _confirmSwitchMode();
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            _buildBody(),
+            // Controls float over the full-bleed preview; SafeArea keeps them
+            // clear of a landscape notch or camera cutout.
+            SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        _OverlayButton(icon: Icons.settings_outlined, tooltip: 'Settings', onPressed: _showSettings),
                         const SizedBox(width: 8),
                         Flexible(
                           child: _Pill(
-                            icon: const Icon(Icons.cloud_off, color: Colors.white70, size: 14),
-                            child: Text(_connectionProblem!, style: const TextStyle(color: Colors.white70)),
+                            child: Text(
+                              _credentials.name,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                            ),
                           ),
                         ),
+                        if (ready && _isLiveToViewer) ...[
+                          const SizedBox(width: 8),
+                          const _Pill(
+                            icon: Icon(Icons.wifi_tethering, color: Colors.greenAccent, size: 14),
+                            child: Text(
+                              'LIVE',
+                              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ],
+                        if (ready && _connectionProblem != null) ...[
+                          const SizedBox(width: 8),
+                          Flexible(
+                            child: _Pill(
+                              icon: const Icon(Icons.cloud_off, color: Colors.white70, size: 14),
+                              child: Text(_connectionProblem!, style: const TextStyle(color: Colors.white70)),
+                            ),
+                          ),
+                        ],
                       ],
-                    ],
-                  ),
-                  const Spacer(),
-                  if (ready && _motionActive)
-                    const _Pill(
-                      icon: Icon(Icons.directions_run, color: Colors.orangeAccent, size: 14),
-                      child: Text(
-                        'MOTION · REC',
-                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                      ),
                     ),
-                ],
+                    const Spacer(),
+                    if (ready && _motionActive)
+                      const _Pill(
+                        icon: Icon(Icons.directions_run, color: Colors.orangeAccent, size: 14),
+                        child: Text(
+                          'MOTION · REC',
+                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                  ],
+                ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -541,8 +599,9 @@ class _Clip {
   final File file;
   final recorder = rtc.MediaRecorder();
 
-  /// Set from the server's `motion-start` ack; null until then.
-  String? eventId;
+  /// Completes with the event id from the server's `motion-start` ack (null
+  /// if the server refused it).
+  final eventId = Completer<String?>();
 }
 
 /// A translucent rounded label for text over the camera preview.

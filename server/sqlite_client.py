@@ -7,7 +7,7 @@ from types import SimpleNamespace
 # A local SQLite stand-in for the supabase client, for development and tests
 # (set SQLITE_PATH). It implements just the slice of the PostgREST query
 # builder the server uses — select (with one level of many-to-one embedding,
-# e.g. `devices(name)`), insert, update, delete, the eq/is_/gt/in_ filters,
+# e.g. `devices(name)`), insert, update, delete, the eq/is_/gt/lt/in_ filters,
 # order, limit, and the `provision_user` RPC — by translating each query to
 # SQL. Mirrors supabase/schema.sql, minus Postgres-only parts (RLS, the
 # auth.users link).
@@ -53,9 +53,19 @@ create table if not exists motion_events (
   household_id text not null references households (id) on delete cascade,
   started_at real not null,
   ended_at real,
-  clip_filename text,
+  clip_key text,
   clip_size_bytes integer
 );
+create table if not exists clip_deletions (
+  clip_key text primary key,
+  queued_at real not null
+);
+create trigger if not exists motion_events_queue_clip_deletion
+after delete on motion_events
+when old.clip_key is not null
+begin
+  insert or ignore into clip_deletions (clip_key, queued_at) values (old.clip_key, (julianday('now') - 2440587.5) * 86400.0);
+end;
 '''
 
 # (table, embedded table) -> the foreign key column on `table`.
@@ -72,7 +82,20 @@ class SQLiteClient:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._conn.execute('pragma foreign_keys = on')
+        self._migrate()
         self._conn.executescript(SCHEMA)
+
+    def _migrate(self):
+        """Brings a database made by an older version up to SCHEMA, for the
+        changes `create table if not exists` can't make."""
+        columns = {row['name'] for row in self._conn.execute('pragma table_info(motion_events)')}
+        if 'clip_filename' in columns:
+            # Clips were stored as RECORDINGS_DIR/<device id>/<filename>,
+            # which LocalStorage still finds under that key.
+            self._conn.execute('alter table motion_events rename column clip_filename to clip_key')
+            self._conn.execute(
+                "update motion_events set clip_key = device_id || '/' || clip_key where clip_key is not null"
+            )
 
     def table(self, name):
         return _Query(self, name)
@@ -145,6 +168,9 @@ class _Query:
 
     def gt(self, column, value):
         return self._filter(f'{self._col(column)} > ?', value)
+
+    def lt(self, column, value):
+        return self._filter(f'{self._col(column)} < ?', value)
 
     def is_(self, column, value):
         if value != 'null':

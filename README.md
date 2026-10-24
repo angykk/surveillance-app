@@ -52,7 +52,7 @@ SQLITE_PATH=data/local.db
 
 **Supabase database:**
 
-1. In the project's **SQL Editor**, run `server/supabase/schema.sql`. It's safe to re-run.
+1. In the project's **SQL Editor**, run `server/supabase/schema.sql`. It's safe to re-run. It also creates the private `clips` Storage bucket that motion clips are uploaded to.
 2. Set `server/.env`:
 
    ```
@@ -76,7 +76,11 @@ Start the server:
 python web_rtc.py
 ```
 
-It listens on `0.0.0.0:5050`. Clips are saved under `server/data/recordings/`.
+It listens on `0.0.0.0:5050`.
+
+**Clips:** with Supabase, cameras upload clips straight to the `clips` bucket through signed URLs, and viewers play them from signed URLs too. With SQLite, they're saved under `server/data/recordings/` and the server hands out the signed URLs itself.
+
+Motion events and their clips are deleted after `RETENTION_DAYS` (default 30; `0` keeps them). The server checks hourly. Clips whose event is deleted any other way, such as a household or Supabase Auth user being deleted, are removed from storage on the same pass.
 
 ## 4. Mobile app
 
@@ -102,6 +106,8 @@ Both phones must be able to reach `SERVER_IP` and LiveKit. For now, put them on 
 1. **Phone A:** choose **Viewer Mode**, create an account or sign in, then tap **Add camera** to show a pairing QR code.
 2. **Phone B:** choose **Camera Mode**, name the camera, and scan the code.
 3. On phone A, tap the camera to watch it live. Wave at it, and a motion event shows up in the timeline. Its clip becomes playable a few seconds after the motion stops.
+
+The camera phone keeps its screen on while Camera Mode runs. If it can't reach the server, it keeps finished clips (up to 500 MB) and uploads them once it's back online, even after an app restart.
 
 Each phone remembers its mode. To change it, use **⚙ → Switch mode**.
 

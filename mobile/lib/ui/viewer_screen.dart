@@ -235,10 +235,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
     setState(() => _clipEvent = event);
     _setLiveAudio(false);
     try {
-      final controller = VideoPlayerController.networkUrl(
-        widget.motionApi.clipUrl(event.id),
-        httpHeaders: await widget.motionApi.clipHeaders(),
-      );
+      final controller = VideoPlayerController.networkUrl(await widget.motionApi.clipUrl(event.id));
       // Another clip may have been picked (or the screen closed) meanwhile.
       if (!mounted || _clipEvent?.id != event.id) {
         controller.dispose();

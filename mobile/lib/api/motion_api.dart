@@ -50,20 +50,37 @@ class MotionApi {
     return items.map((e) => MotionEvent.fromJson(e as Map<dynamic, dynamic>)).toList();
   }
 
+  /// Uploads [file] as [eventId]'s clip: the server hands out a signed URL,
+  /// the file goes straight to clip storage, then the server is told it's
+  /// there. Throws [ApiException] on a refusal from either.
   Future<void> uploadClip(String eventId, File file) async {
-    final path = '/motion-events/$eventId/clip';
-    final request = http.MultipartRequest('POST', _client.uri(path))
-      ..headers.addAll(await _client.authHeaders())
-      ..files.add(await http.MultipartFile.fromPath('file', file.path));
-    final response = await request.send();
-    if (response.statusCode != 204) {
-      throw ApiException(response.statusCode, 'POST $path');
-    }
+    final grant = await _client.send('POST', '/motion-events/$eventId/clip/upload') as Map<String, dynamic>;
+    final status = await _put(Uri.parse(grant['url'] as String), file).timeout(_uploadTimeout);
+    if (status != 200) throw ApiException(status, 'PUT clip upload');
+    await _client.send('POST', '/motion-events/$eventId/clip/done', expectStatus: 204);
   }
 
-  Uri clipUrl(String eventId) => _client.uri('/motion-events/$eventId/clip');
+  /// Streams [file] as the request body rather than reading it into memory.
+  static Future<int> _put(Uri url, File file) async {
+    final request = http.StreamedRequest('PUT', url)
+      ..headers['Content-Type'] = 'video/mp4'
+      ..contentLength = await file.length();
+    final sent = request.send();
+    await request.sink.addStream(file.openRead());
+    await request.sink.close();
+    final response = await sent;
+    await response.stream.drain<void>();
+    return response.statusCode;
+  }
 
-  /// Headers the video player must send when streaming [clipUrl], since
-  /// clips are only served to members of the camera's household.
-  Future<Map<String, String>> clipHeaders() => _client.authHeaders();
+  /// Covers the PUT of the file itself, which takes much longer than an
+  /// ordinary API call on a slow uplink.
+  static const _uploadTimeout = Duration(minutes: 5);
+
+  /// A short-lived URL the video player streams [eventId]'s clip from. It's
+  /// signed for that one clip, so the player sends no auth headers.
+  Future<Uri> clipUrl(String eventId) async {
+    final data = await _client.send('GET', '/motion-events/$eventId/clip-url') as Map<String, dynamic>;
+    return Uri.parse(data['url'] as String);
+  }
 }
