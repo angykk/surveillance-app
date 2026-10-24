@@ -75,27 +75,6 @@ create table if not exists public.motion_events (
 create index if not exists motion_events_device_id_started_at_idx on public.motion_events (device_id, started_at desc);
 create index if not exists motion_events_household_id_idx on public.motion_events (household_id);
 
--- Clips used to live in their own `recordings` table; they now belong to
--- motion events. Projects set up before that still have the old table; drop
--- it by hand once its clips are no longer wanted (this script never drops
--- data on its own):
--- drop table if exists public.recordings;
-
--- Projects set up before clips moved to Storage have `clip_filename`, which
--- named a file on the server's disk. Those files aren't in the bucket, so
--- their events lose their clips.
-do $$
-begin
-  if exists (
-    select 1 from information_schema.columns
-    where table_schema = 'public' and table_name = 'motion_events' and column_name = 'clip_filename'
-  ) then
-    alter table public.motion_events rename column clip_filename to clip_key;
-    update public.motion_events set clip_key = null, clip_size_bytes = null;
-  end if;
-end;
-$$;
-
 -- Storage keys of clips whose motion event is gone, waiting for the
 -- server's retention job to delete them from the bucket. A trigger fills
 -- it, so cascades the server never sees (a deleted household, or a user

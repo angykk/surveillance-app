@@ -182,3 +182,73 @@ def test_camera_disconnect_closes_open_motion_event(app, client):
     assert _last(alice, 'motion')['ended_at'] is not None
     [event] = client.get(f"/devices/{cam['device_id']}/motion-events", headers=as_user('alice')).get_json()
     assert event['ended_at'] is not None
+
+
+def test_camera_that_drops_out_of_its_room_gets_a_fresh_grant(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    alice = _connect_viewer(app, 'alice')
+    _watch(alice, cam['device_id'])
+    camera.get_received()
+
+    # Still watched: the camera is asked to rejoin right away.
+    camera.emit('stream-ended')
+    assert _video_grant(_last(camera, 'stream-start'))['room'] == cam['device_id']
+
+
+def test_unwatched_camera_that_drops_out_is_restarted_by_the_next_watcher(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    alice = _connect_viewer(app, 'alice')
+    _watch(alice, cam['device_id'])
+    alice.emit('stop-watching')
+    camera.get_received()
+
+    camera.emit('stream-ended')
+    assert _names(camera) == []
+    _watch(alice, cam['device_id'])
+    assert _names(camera) == ['stream-start']
+
+
+def test_retrying_a_camera_that_dropped_out_while_watched_restarts_it(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    phone_a = _connect_viewer(app, 'alice')
+    phone_b = _connect_viewer(app, 'alice')
+    _watch(phone_a, cam['device_id'])
+    camera.get_received()
+
+    camera.emit('stream-ended')
+    camera.get_received()
+    # A second viewer arriving after the rejoin doesn't start it twice.
+    _watch(phone_b, cam['device_id'])
+    assert _names(camera) == []
+
+
+def test_viewers_cannot_send_stream_ended(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    alice = _connect_viewer(app, 'alice')
+    camera.get_received()
+    alice.emit('stream-ended')
+    assert _names(camera) == []
+
+
+def test_rename_from_viewer_mode_reaches_the_camera(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    camera.get_received()
+
+    client.patch(f"/devices/{cam['device_id']}", json={'name': 'Back Door'}, headers=as_user('alice'))
+    assert _last(camera, 'renamed') == {'name': 'Back Door'}
+
+
+def test_rename_only_reaches_the_renamed_camera(app, client):
+    front = pair_camera(client, 'alice')
+    garage = pair_camera(client, 'alice', name='Garage')
+    _connect_camera(app, front['device_token'])
+    garage_camera = _connect_camera(app, garage['device_token'])
+    garage_camera.get_received()
+
+    client.patch(f"/devices/{front['device_id']}", json={'name': 'Back Door'}, headers=as_user('alice'))
+    assert 'renamed' not in _names(garage_camera)

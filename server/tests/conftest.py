@@ -5,7 +5,7 @@ import pytest
 
 import livekit_rooms
 import signaling
-from web_rtc import create_app
+from app import create_app
 
 TEST_SECRET = 'test-secret-at-least-32-bytes-long!!'
 LIVEKIT_SECRET = 'livekit-test-secret-at-least-32-bytes'

@@ -3,6 +3,7 @@ from flask import Blueprint, abort, g, jsonify, request
 import auth
 import clip_storage
 import db
+import households
 import signaling
 
 bp = Blueprint('motion', __name__)
@@ -32,13 +33,7 @@ def _event_or_404(event_id):
 def list_motion_events(device_id):
     """A camera's motion history, newest first, for the viewer's timeline.
     Live updates arrive separately as `motion` socket events."""
-    if not db.is_id(device_id):
-        abort(404)
-    device = db.first(
-        db.table('devices').select('household_id').eq('id', device_id).is_('revoked_at', 'null').limit(1).execute()
-    )
-    if device is None:
-        abort(404)
+    device = households.device_or_404(device_id)
     auth.require_member(device['household_id'])
 
     limit = min(request.args.get('limit', HISTORY_DEFAULT_LIMIT, type=int), HISTORY_MAX_LIMIT)
@@ -71,10 +66,11 @@ def clip_upload_url(event_id):
     event = _own_event_or_404(event_id)
     if event['clip_size_bytes'] is not None:
         abort(409)
-    key = clip_storage.clip_key(event)
-    if event['clip_key'] is None:
+    key = event['clip_key']
+    if key is None:
         # Recorded before the upload, so retention and deletions clean the
         # object up even if the camera never reports it done.
+        key = clip_storage.clip_key(event)
         db.table('motion_events').update({'clip_key': key}).eq('id', event_id).execute()
     return jsonify({'url': clip_storage.get().upload_url(key)})
 

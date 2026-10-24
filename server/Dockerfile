@@ -13,9 +13,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py ./
 
-# Recordings live here; mount a volume to keep them.
+# Clips are kept here only with a local SQLite database (SQLITE_PATH); with
+# Supabase they go to the Storage bucket.
 RUN useradd --create-home app && mkdir -p /app/data && chown app /app/data
 USER app
 
 EXPOSE 5050
-CMD ["python", "web_rtc.py"]
+# One worker: presence state is per-process (see signaling.py). Each open
+# Socket.IO connection holds a thread, so --threads caps concurrent clients.
+CMD ["gunicorn", "--workers", "1", "--threads", "100", "--bind", "0.0.0.0:5050", "wsgi:app"]

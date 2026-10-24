@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../api/motion_api.dart';
+import 'shared_widgets.dart';
 
 /// How long after an event ends its clip is still expected to arrive; past
 /// that, an event without one is shown as having no clip.
@@ -37,12 +38,17 @@ class MotionTimeline extends StatelessWidget {
     if (loading && events.isEmpty) {
       content = const Center(child: CircularProgressIndicator());
     } else if (error != null && events.isEmpty) {
-      content = _Message(
+      content = MessageView(
         message: error!,
+        textColor: theme.colorScheme.outline,
+        actionSpacing: 8,
         action: TextButton(onPressed: onRefresh, child: const Text('Retry')),
       );
     } else if (events.isEmpty) {
-      content = const _Message(message: 'No motion yet.\nMovement this camera sees will show up here.');
+      content = MessageView(
+        message: 'No motion yet.\nMovement this camera sees will show up here.',
+        textColor: theme.colorScheme.outline,
+      );
     } else {
       final rows = _rows();
       content = RefreshIndicator(
@@ -162,33 +168,6 @@ String _formatDuration(Duration d) {
   final seconds = d.inSeconds % 60;
   if (d.inHours < 1) return seconds == 0 ? '${d.inMinutes}m' : '${d.inMinutes}m ${seconds}s';
   return '${d.inHours}h ${d.inMinutes % 60}m';
-}
-
-class _Message extends StatelessWidget {
-  const _Message({required this.message, this.action});
-
-  final String message;
-  final Widget? action;
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              message,
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Theme.of(context).colorScheme.outline),
-            ),
-            if (action != null) ...[const SizedBox(height: 8), action!],
-          ],
-        ),
-      ),
-    );
-  }
 }
 
 /// A dot that fades in and out, marking motion that's happening right now.

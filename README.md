@@ -73,7 +73,7 @@ LIVEKIT_API_SECRET=secret
 Start the server:
 
 ```
-python web_rtc.py
+python app.py
 ```
 
 It listens on `0.0.0.0:5050`.

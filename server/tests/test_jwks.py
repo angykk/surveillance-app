@@ -5,7 +5,7 @@ import jwt
 from cryptography.hazmat.primitives.asymmetric import ec
 
 import auth
-from web_rtc import create_app
+from app import create_app
 
 SUPABASE_URL = 'https://example-ref.supabase.co'
 

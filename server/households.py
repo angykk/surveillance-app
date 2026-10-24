@@ -27,6 +27,10 @@ def _clean_name(value, *, max_length=64):
     return name
 
 
+def _name_from_body():
+    return _clean_name((request.get_json(silent=True) or {}).get('name'))
+
+
 @bp.route('/me')
 @auth.require_user
 def me():
@@ -46,7 +50,7 @@ def me():
 @bp.route('/households', methods=['POST'])
 @auth.require_user
 def create_household():
-    name = _clean_name((request.get_json(silent=True) or {}).get('name'))
+    name = _name_from_body()
     household_id = db.new_id()
     ts = db.now()
     db.table('households').insert({
@@ -123,14 +127,16 @@ def pair_device():
 @auth.require_device
 def rename_own_device():
     """Lets a camera rename itself from Camera Mode, using its device token."""
-    name = _clean_name((request.get_json(silent=True) or {}).get('name'))
+    name = _name_from_body()
     device = g.device
     db.table('devices').update({'name': name}).eq('id', device['id']).execute()
     signaling.device_renamed(device['id'], device['household_id'], name)
     return jsonify({'id': device['id'], 'name': name})
 
 
-def _device_or_404(device_id):
+def device_or_404(device_id):
+    """A paired (non-revoked) camera by the id in a URL, or a 404. Callers
+    still check the user's membership in its household."""
     if not db.is_id(device_id):
         abort(404)
     device = db.first(
@@ -141,12 +147,19 @@ def _device_or_404(device_id):
     return device
 
 
+def _managed_device_or_404(device_id):
+    """A camera the calling user may rename or remove: an owner or admin
+    of its household."""
+    device = device_or_404(device_id)
+    auth.require_member(device['household_id'], roles=db.MANAGER_ROLES)
+    return device
+
+
 @bp.route('/devices/<device_id>', methods=['PATCH'])
 @auth.require_user
 def rename_device(device_id):
-    device = _device_or_404(device_id)
-    auth.require_member(device['household_id'], roles=db.MANAGER_ROLES)
-    name = _clean_name((request.get_json(silent=True) or {}).get('name'))
+    device = _managed_device_or_404(device_id)
+    name = _name_from_body()
     db.table('devices').update({'name': name}).eq('id', device_id).execute()
     signaling.device_renamed(device_id, device['household_id'], name)
     return jsonify({'id': device_id, 'name': name})
@@ -157,8 +170,7 @@ def rename_device(device_id):
 def revoke_device(device_id):
     """Removes a camera from its household: its token stops working
     immediately and any live connection is dropped."""
-    device = _device_or_404(device_id)
-    auth.require_member(device['household_id'], roles=db.MANAGER_ROLES)
+    device = _managed_device_or_404(device_id)
     db.table('devices').update({'revoked_at': db.now()}).eq('id', device_id).execute()
     signaling.device_revoked(device_id, device['household_id'])
     return '', 204

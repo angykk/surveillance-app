@@ -63,7 +63,7 @@ class HouseholdsApi {
     ) as Map<String, dynamic>;
     return PairingCode(
       code: json['code'] as String,
-      expiresAt: DateTime.fromMillisecondsSinceEpoch(((json['expires_at'] as num) * 1000).round()),
+      expiresAt: dateTimeFromEpochSeconds(json['expires_at'] as num),
     );
   }
 

@@ -3,9 +3,8 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../api/api_client.dart';
 
 /// This device's identity when acting as a Camera, issued by the server when
-/// a pairing code is redeemed. Replaces the old self-generated `camera_id`:
-/// the id is server-assigned and the token proves it, so one camera can't
-/// claim to be another.
+/// a pairing code is redeemed. The id is server-assigned and the token
+/// proves it, so one camera can't claim to be another.
 ///
 /// Kept in the platform keychain/keystore rather than shared_preferences,
 /// since the token is a long-lived credential for the household.

@@ -59,6 +59,9 @@ class ApiClient {
   }
 }
 
+/// The server sends times as Unix epoch seconds, possibly fractional.
+DateTime dateTimeFromEpochSeconds(num seconds) => DateTime.fromMillisecondsSinceEpoch((seconds * 1000).round());
+
 class ApiException extends HttpException {
   ApiException(this.statusCode, String request) : super('$request failed with status $statusCode');
 

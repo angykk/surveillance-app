@@ -33,6 +33,10 @@ class SignalingClient {
   static String? refusalReason(dynamic connectErrorData) =>
       connectErrorData is Map ? connectErrorData['message'] as String? : null;
 
+  /// Whether a `disconnect` event's [reason] says the server ended the
+  /// connection, which socket_io_client doesn't reconnect after by itself.
+  static bool serverEndedConnection(dynamic reason) => reason == 'io server disconnect';
+
   void dispose() {
     socket.dispose();
   }

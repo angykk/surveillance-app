@@ -4,9 +4,10 @@ import 'package:livekit_client/livekit_client.dart';
 import 'package:video_player/video_player.dart';
 
 import '../api/motion_api.dart';
-import '../webrtc/signaling_client.dart';
+import '../signaling/signaling_client.dart';
 import 'camera_list_screen.dart';
 import 'motion_timeline.dart';
+import 'shared_widgets.dart';
 
 /// Width of the motion timeline beside the video in landscape.
 const _timelinePanelWidth = 320.0;
@@ -390,7 +391,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   if (landscape) ...[
-                    _OverlayButton(
+                    OverlayButton(
                       icon: Icons.arrow_back,
                       tooltip: 'Back',
                       onPressed: () => Navigator.of(context).maybePop(),
@@ -406,7 +407,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
                       runSpacing: 8,
                       children: [
                         if (landscape)
-                          _Pill(
+                          OverlayPill(padding: _pillPadding, 
                             child: Text(
                               _camera.name,
                               overflow: TextOverflow.ellipsis,
@@ -414,7 +415,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
                             ),
                           ),
                         if (_clipEvent != null)
-                          _Pill(
+                          OverlayPill(padding: _pillPadding, 
                             icon: const Icon(Icons.history, color: Colors.white, size: 14),
                             child: Text(
                               'Clip · ${DateFormat.jm().format(_clipEvent!.startedAt)}',
@@ -423,7 +424,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
                             ),
                           )
                         else if (_isLive)
-                          const _Pill(
+                          const OverlayPill(padding: _pillPadding, 
                             icon: Icon(Icons.circle, color: Colors.redAccent, size: 10),
                             child: Text(
                               'LIVE',
@@ -431,7 +432,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
                             ),
                           ),
                         if (_motionNow)
-                          const _Pill(
+                          const OverlayPill(padding: _pillPadding, 
                             icon: PulsingDot(color: Colors.orange, size: 10),
                             child: Text(
                               'Motion now',
@@ -453,7 +454,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
                     if (landscape) const SizedBox(width: 8),
                   ],
                   if (landscape)
-                    _OverlayButton(
+                    OverlayButton(
                       icon: _showTimeline ? Icons.fullscreen : Icons.view_sidebar_outlined,
                       tooltip: _showTimeline ? 'Hide timeline' : 'Show timeline',
                       onPressed: () => setState(() => _showTimeline = !_showTimeline),
@@ -538,6 +539,10 @@ class _ClipView extends StatelessWidget {
 
 String _mmss(Duration d) => '${d.inMinutes}:${(d.inSeconds % 60).toString().padLeft(2, '0')}';
 
+/// Pills over the viewer's video are a little smaller than the camera
+/// phone's: they share the frame with the motion timeline.
+const _pillPadding = EdgeInsets.symmetric(horizontal: 10, vertical: 6);
+
 class _VideoPlaceholder extends StatelessWidget {
   const _VideoPlaceholder({required this.status, required this.offline, this.onRetry});
 
@@ -547,72 +552,22 @@ class _VideoPlaceholder extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Center(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.fromLTRB(24, 56, 24, 16),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(offline ? Icons.videocam_off_outlined : Icons.videocam_outlined, size: 40, color: Colors.white54),
-            const SizedBox(height: 12),
-            Text(
-              status,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.white70),
+    return MessageView(
+      icon: offline ? Icons.videocam_off_outlined : Icons.videocam_outlined,
+      iconSize: 40,
+      iconColor: Colors.white54,
+      message: status,
+      textColor: Colors.white70,
+      padding: const EdgeInsets.fromLTRB(24, 56, 24, 16),
+      actionSpacing: 8,
+      action: onRetry == null
+          ? null
+          : TextButton.icon(
+              style: TextButton.styleFrom(foregroundColor: Colors.white),
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh),
+              label: const Text('Try again'),
             ),
-            if (onRetry != null) ...[
-              const SizedBox(height: 8),
-              TextButton.icon(
-                style: TextButton.styleFrom(foregroundColor: Colors.white),
-                onPressed: onRetry,
-                icon: const Icon(Icons.refresh),
-                label: const Text('Try again'),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// A translucent rounded label for text over the video.
-class _Pill extends StatelessWidget {
-  const _Pill({required this.child, this.icon});
-
-  final Widget child;
-  final Widget? icon;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(20)),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          if (icon != null) ...[icon!, const SizedBox(width: 6)],
-          Flexible(child: child),
-        ],
-      ),
-    );
-  }
-}
-
-class _OverlayButton extends StatelessWidget {
-  const _OverlayButton({required this.icon, required this.tooltip, required this.onPressed});
-
-  final IconData icon;
-  final String tooltip;
-  final VoidCallback onPressed;
-
-  @override
-  Widget build(BuildContext context) {
-    return IconButton.filled(
-      style: IconButton.styleFrom(backgroundColor: Colors.black54, foregroundColor: Colors.white),
-      icon: Icon(icon),
-      tooltip: tooltip,
-      onPressed: onPressed,
     );
   }
 }

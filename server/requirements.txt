@@ -4,3 +4,4 @@ supabase==2.33.0
 livekit-api==1.2.2
 PyJWT[crypto]>=2.9,<3
 python-dotenv>=1.0,<2
+gunicorn==23.0.0

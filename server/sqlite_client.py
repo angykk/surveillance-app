@@ -82,20 +82,7 @@ class SQLiteClient:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._conn.execute('pragma foreign_keys = on')
-        self._migrate()
         self._conn.executescript(SCHEMA)
-
-    def _migrate(self):
-        """Brings a database made by an older version up to SCHEMA, for the
-        changes `create table if not exists` can't make."""
-        columns = {row['name'] for row in self._conn.execute('pragma table_info(motion_events)')}
-        if 'clip_filename' in columns:
-            # Clips were stored as RECORDINGS_DIR/<device id>/<filename>,
-            # which LocalStorage still finds under that key.
-            self._conn.execute('alter table motion_events rename column clip_filename to clip_key')
-            self._conn.execute(
-                "update motion_events set clip_key = device_id || '/' || clip_key where clip_key is not null"
-            )
 
     def table(self, name):
         return _Query(self, name)

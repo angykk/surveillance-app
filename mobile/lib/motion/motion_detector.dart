@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:isolate';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 
 /// Background-subtraction motion detector.
@@ -16,30 +16,44 @@ import 'package:opencv_dart/opencv_dart.dart' as cv;
 /// second on the UI isolate made the camera screen stutter, and froze it once
 /// a warm, throttled phone took longer than a second per frame.
 class MotionDetector {
-  MotionDetector() {
-    _ready = _start();
+  /// [worker] stands in for the OpenCV worker in tests.
+  MotionDetector({@visibleForTesting void Function(SendPort responses) worker = _workerMain}) {
+    _ready = _start(worker);
   }
 
   late final Future<void> _ready;
   Isolate? _isolate;
+  final _handshake = Completer<SendPort?>();
   SendPort? _requests;
   final _responses = ReceivePort();
   final _pending = <int, Completer<bool>>{};
   int _nextId = 0;
   bool _disposed = false;
 
-  Future<void> _start() async {
-    final handshake = Completer<SendPort>();
+  Future<void> _start(void Function(SendPort) worker) async {
     _responses.listen((message) {
       if (message is SendPort) {
-        handshake.complete(message);
+        if (!_handshake.isCompleted) _handshake.complete(message);
       } else if (message is (int, bool)) {
         _pending.remove(message.$1)?.complete(message.$2);
       }
     });
-    _isolate = await Isolate.spawn(_workerMain, _responses.sendPort, debugName: 'motion-detector');
-    _requests = await handshake.future;
+    final isolate = await Isolate.spawn(worker, _responses.sendPort, debugName: 'motion-detector');
+    _isolate = isolate;
+    // Disposed while the isolate was starting: [dispose] had nothing to
+    // kill yet, so the isolate would have run on, unused, for good.
+    if (_disposed) {
+      isolate.kill(priority: Isolate.immediate);
+      return;
+    }
+    _requests = await _handshake.future;
   }
+
+  @visibleForTesting
+  Future<void> get ready => _ready;
+
+  @visibleForTesting
+  Isolate? get isolate => _isolate;
 
   /// Whether [encodedFrame] shows motion against the frames before it.
   Future<bool> detect(Uint8List encodedFrame) async {
@@ -52,11 +66,24 @@ class MotionDetector {
     return result.future;
   }
 
+  /// Forgets the learned background and restarts the warmup. Call whenever
+  /// the camera is reopened: a fresh camera spends its first moments settling
+  /// exposure, white balance and focus, and against the old camera's
+  /// background those frames read as motion across the whole picture.
+  Future<void> reset() async {
+    await _ready;
+    if (_disposed) return;
+    _requests!.send(_resetRequest);
+  }
+
   void dispose() {
     _disposed = true;
     // The isolate's OpenCV objects go with it.
     _isolate?.kill(priority: Isolate.immediate);
     _responses.close();
+    // The handshake can't arrive on the closed port; don't leave [_ready]
+    // waiting on it forever.
+    if (!_handshake.isCompleted) _handshake.complete(null);
     for (final pending in _pending.values) {
       pending.complete(false);
     }
@@ -64,11 +91,18 @@ class MotionDetector {
   }
 }
 
+const _resetRequest = 'reset';
+
 void _workerMain(SendPort responses) {
   final requests = ReceivePort();
   responses.send(requests.sendPort);
-  final detector = _Mog2Detector();
+  var detector = _Mog2Detector();
   requests.listen((message) {
+    if (message == _resetRequest) {
+      detector.dispose();
+      detector = _Mog2Detector();
+      return;
+    }
     final (id, data) = message as (int, TransferableTypedData);
     var motion = false;
     try {
@@ -128,5 +162,10 @@ class _Mog2Detector {
     contours.dispose();
 
     return hasMotion;
+  }
+
+  void dispose() {
+    _bgSubtractor.dispose();
+    _dilateKernel.dispose();
   }
 }

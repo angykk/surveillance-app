@@ -4,6 +4,7 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import '../api/api_client.dart';
 import '../api/households_api.dart';
 import '../config.dart';
+import '../ui/shared_widgets.dart';
 import 'device_credentials.dart';
 
 /// First-run setup for Camera Mode: name this camera, then scan the pairing
@@ -69,7 +70,11 @@ class _PairCameraScreenState extends State<PairCameraScreen> {
         code: code,
         name: _nameController.text.trim(),
       );
-      await _scanner.stop();
+      // Paired and saved by now, so a scanner that won't stop mustn't turn
+      // that into a "could not reach the server" error.
+      try {
+        await _scanner.stop();
+      } catch (_) {}
       widget.onPaired(credentials);
     } on ApiException catch (e) {
       if (!mounted) return;
@@ -142,23 +147,12 @@ class _PairCameraScreenState extends State<PairCameraScreen> {
         Text(_error!, style: TextStyle(color: theme.colorScheme.error)),
       ],
       const SizedBox(height: 16),
-      FilledButton(
-        onPressed: _canPair ? _pair : null,
-        child: _pairing
-            ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-            : const Text('Pair camera'),
-      ),
+      LoadingButton(loading: _pairing, onPressed: _canPair ? _pair : null, label: 'Pair camera'),
     ];
 
     final appBar = AppBar(
       title: const Text('Set up this camera'),
-      actions: [
-        TextButton.icon(
-          onPressed: widget.onSwitchMode,
-          icon: const Icon(Icons.swap_horiz),
-          label: const Text('Switch mode'),
-        ),
-      ],
+      actions: [SwitchModeButton(onPressed: widget.onSwitchMode)],
     );
 
     // The camera phone will run in landscape, so it may well be held that

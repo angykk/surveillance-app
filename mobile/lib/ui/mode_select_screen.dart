@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 
 import 'app_mode_controller.dart';
 
-/// Entry screen: choose whether this device acts as a Camera/Server or a
-/// Viewer/Client. Shown only until a mode is chosen; the choice persists,
+/// Entry screen: choose whether this device acts as a Camera or a Viewer.
+/// Shown only until a mode is chosen; the choice persists,
 /// and switching later goes through that mode's settings.
 class ModeSelectScreen extends StatelessWidget {
   const ModeSelectScreen({super.key, required this.onSelected});

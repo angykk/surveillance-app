@@ -12,7 +12,9 @@ import retention
 import signaling
 from sqlite_client import SQLiteClient
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), 'data')
+# Relative paths in the config (SQLITE_PATH, RECORDINGS_DIR) resolve against
+# server/, whatever directory the server is started from.
+SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def create_app(overrides=None):
@@ -26,7 +28,7 @@ def create_app(overrides=None):
         # falls back to the default.
         # Where clips are kept with a local SQLite database (local testing).
         # With Supabase they go to the CLIP_BUCKET Storage bucket instead.
-        RECORDINGS_DIR=os.environ.get('RECORDINGS_DIR') or os.path.join(DATA_DIR, 'recordings'),
+        RECORDINGS_DIR=os.environ.get('RECORDINGS_DIR') or os.path.join('data', 'recordings'),
         CLIP_BUCKET=os.environ.get('CLIP_BUCKET') or 'clips',
         # Signs LocalStorage's clip URLs. A random one per process is fine:
         # cameras ask for a fresh upload URL on every try.
@@ -49,7 +51,7 @@ def create_app(overrides=None):
         LIVEKIT_API_SECRET=os.environ.get('LIVEKIT_API_SECRET', ''),
         # Caps request bodies, including clip uploads to LocalStorage;
         # Werkzeug rejects anything larger with a 413.
-        MAX_CONTENT_LENGTH=int(os.environ.get('MAX_UPLOAD_MB', '200')) * 1024 * 1024,
+        MAX_CONTENT_LENGTH=int(os.environ.get('MAX_UPLOAD_MB') or '200') * 1024 * 1024,
     )
     if overrides:
         app.config.update(overrides)
@@ -58,10 +60,11 @@ def create_app(overrides=None):
         raise RuntimeError('Set SUPABASE_URL (and SUPABASE_JWT_SECRET for legacy HS256 projects) to verify sign-ins.')
 
     if app.config['SQLITE_PATH']:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), app.config['SQLITE_PATH'])
+        path = os.path.join(SERVER_DIR, app.config['SQLITE_PATH'])
         os.makedirs(os.path.dirname(path), exist_ok=True)
         db.use_client(SQLiteClient(path))
         print(f'Using local SQLite database {path}')
+        app.config['RECORDINGS_DIR'] = os.path.join(SERVER_DIR, app.config['RECORDINGS_DIR'])
         os.makedirs(app.config['RECORDINGS_DIR'], exist_ok=True)
         app.extensions['clip_storage'] = clip_storage.LocalStorage(app.config['RECORDINGS_DIR'], app.config['SECRET_KEY'])
     elif app.config['SUPABASE_URL'] and app.config['SUPABASE_KEY']:
@@ -69,6 +72,7 @@ def create_app(overrides=None):
         app.extensions['clip_storage'] = clip_storage.SupabaseStorage(client, app.config['CLIP_BUCKET'])
     else:
         raise RuntimeError('Set SUPABASE_KEY (the secret key), or SQLITE_PATH for a local database, in .env.')
+    signaling.close_orphaned_motion_events()
 
     if not (app.config['LIVEKIT_URL'] and app.config['LIVEKIT_API_KEY'] and app.config['LIVEKIT_API_SECRET']):
         raise RuntimeError('Set LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET in .env for live video.')
@@ -90,6 +94,7 @@ def create_app(overrides=None):
 
 
 if __name__ == '__main__':
+    # Local development only: production runs under gunicorn (see wsgi.py).
     load_dotenv()
     app = create_app()
     # Debug mode exposes the Werkzeug debugger (arbitrary code execution) to

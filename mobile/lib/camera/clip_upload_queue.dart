@@ -16,13 +16,20 @@ import '../api/motion_api.dart';
 /// whenever [drain] runs: after a clip is added, when the camera's socket
 /// reconnects, and on a timer.
 class ClipUploadQueue {
-  ClipUploadQueue(this._motionApi);
+  /// [folder] stands in for the app-support folder, and [maxBytes] for the
+  /// size limit, in tests.
+  ClipUploadQueue(
+    this._motionApi, {
+    @visibleForTesting Future<Directory> Function()? folder,
+    @visibleForTesting this.maxBytes = 500 * 1024 * 1024,
+  }) : _baseFolder = folder;
 
   final MotionApi _motionApi;
+  final Future<Directory> Function()? _baseFolder;
 
   /// Past this, the oldest clips are dropped to make room, so a camera that
   /// can't reach the server for days doesn't fill the phone.
-  static const maxBytes = 500 * 1024 * 1024;
+  final int maxBytes;
 
   Directory? _dir;
   bool _draining = false;
@@ -31,7 +38,8 @@ class ClipUploadQueue {
   Future<Directory> _folder() async {
     final existing = _dir;
     if (existing != null) return existing;
-    final dir = Directory('${(await getApplicationSupportDirectory()).path}/pending-clips');
+    final base = await (_baseFolder ?? getApplicationSupportDirectory)();
+    final dir = Directory('${base.path}/pending-clips');
     await dir.create(recursive: true);
     // A clip still being recorded when the app died never got its event id
     // matched up, and may not be a playable file anyway.
@@ -63,14 +71,16 @@ class ClipUploadQueue {
       await _delete(recording);
       return;
     }
-    await _enforceLimit();
     unawaited(drain());
   }
 
   Future<void> discard(File recording) => _delete(recording);
 
-  /// Uploads every queued clip it can. Safe to call any time: overlapping
-  /// calls fold into the one already running.
+  /// Uploads every queued clip it can, after dropping the oldest if the
+  /// queue is over [maxBytes]. Safe to call any time: overlapping calls fold
+  /// into the one already running. The size limit is enforced here, between
+  /// uploads, rather than in [add], so it can't delete the clip that's
+  /// uploading or a file [_queued] is still looking at.
   Future<void> drain() async {
     if (_draining) {
       _drainAgain = true;
@@ -80,10 +90,14 @@ class ClipUploadQueue {
     try {
       do {
         _drainAgain = false;
+        await _enforceLimit();
         for (final clip in await _queued()) {
           if (!await _upload(clip)) return;
         }
       } while (_drainAgain);
+    } catch (e) {
+      // Nobody awaits a drain, so an error here would go uncaught.
+      debugPrint('Draining clip queue failed: $e');
     } finally {
       _draining = false;
     }
@@ -117,16 +131,20 @@ class ClipUploadQueue {
   static bool _isPermanent(int status) =>
       status >= 400 && status < 500 && status != 401 && status != 408 && status != 429;
 
-  /// Queued clips, oldest first.
+  /// Queued clips, oldest first. A clip deleted while this looks (e.g. a
+  /// [discard], or one the server just took) is left out.
   Future<List<File>> _queued() async {
     final dir = await _folder();
-    final files = <File>[];
+    final modified = <File, DateTime>{};
     await for (final entity in dir.list()) {
-      if (entity is File && entity.path.endsWith('.mp4') && !_isRecording(entity)) files.add(entity);
+      if (entity is! File || !entity.path.endsWith('.mp4') || _isRecording(entity)) continue;
+      try {
+        modified[entity] = await entity.lastModified();
+      } on FileSystemException {
+        continue;
+      }
     }
-    final modified = {for (final f in files) f.path: await f.lastModified()};
-    files.sort((a, b) => modified[a.path]!.compareTo(modified[b.path]!));
-    return files;
+    return modified.keys.toList()..sort((a, b) => modified[a]!.compareTo(modified[b]!));
   }
 
   Future<void> _enforceLimit() async {
@@ -134,7 +152,11 @@ class ClipUploadQueue {
     var total = 0;
     final sizes = <File, int>{};
     for (final f in files) {
-      total += sizes[f] = await f.length();
+      try {
+        total += sizes[f] = await f.length();
+      } on FileSystemException {
+        sizes[f] = 0;
+      }
     }
     for (final f in files) {
       if (total <= maxBytes) break;

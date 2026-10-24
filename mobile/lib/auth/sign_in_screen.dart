@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../ui/shared_widgets.dart';
 import 'session.dart';
 
 /// Email + password sign-in / sign-up through Supabase Auth. On success,
@@ -71,13 +72,7 @@ class _SignInScreenState extends State<SignInScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(_isSignUp ? 'Create account' : 'Sign in'),
-        actions: [
-          TextButton.icon(
-            onPressed: widget.onSwitchMode,
-            icon: const Icon(Icons.swap_horiz),
-            label: const Text('Switch mode'),
-          ),
-        ],
+        actions: [SwitchModeButton(onPressed: widget.onSwitchMode)],
       ),
       body: Center(
         child: SingleChildScrollView(
@@ -119,11 +114,10 @@ class _SignInScreenState extends State<SignInScreen> {
                     Text(_info!),
                   ],
                   const SizedBox(height: 20),
-                  FilledButton(
-                    onPressed: _busy ? null : _submit,
-                    child: _busy
-                        ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                        : Text(_isSignUp ? 'Create account' : 'Sign in'),
+                  LoadingButton(
+                    loading: _busy,
+                    onPressed: _submit,
+                    label: _isSignUp ? 'Create account' : 'Sign in',
                   ),
                   TextButton(
                     onPressed: _busy

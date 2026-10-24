@@ -5,8 +5,10 @@ import '../api/households_api.dart';
 import '../auth/session.dart';
 import '../api/motion_api.dart';
 import '../config.dart';
-import '../webrtc/signaling_client.dart';
+import '../signaling/signaling_client.dart';
 import 'pairing_code_screen.dart';
+import 'rename_dialog.dart';
+import 'shared_widgets.dart';
 import 'theme_controller.dart';
 import 'viewer_screen.dart';
 
@@ -35,9 +37,7 @@ class CameraInfo {
         householdId: json['household_id'] as String,
         householdName: json['household_name'] as String,
         online: json['online'] as bool,
-        lastSeenAt: json['last_seen_at'] == null
-            ? null
-            : DateTime.fromMillisecondsSinceEpoch(((json['last_seen_at'] as num) * 1000).round()),
+        lastSeenAt: json['last_seen_at'] == null ? null : dateTimeFromEpochSeconds(json['last_seen_at'] as num),
       );
 }
 
@@ -182,42 +182,19 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
   }
 
   Future<void> _renameCamera(CameraInfo camera) async {
-    final controller = TextEditingController(text: camera.name);
-    final newName = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Camera name'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          onSubmitted: (value) => Navigator.of(context).pop(value),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.of(context).pop(controller.text), child: const Text('Save')),
-        ],
-      ),
-    );
-    final trimmed = newName?.trim() ?? '';
-    if (trimmed.isEmpty || trimmed == camera.name) return;
-    await _runAction(() => _householdsApi.renameCamera(camera.id, trimmed), 'Rename failed');
+    final newName = await showRenameCameraDialog(context, current: camera.name);
+    if (newName == null || !mounted) return;
+    await _runAction(() => _householdsApi.renameCamera(camera.id, newName), 'Rename failed');
   }
 
   Future<void> _removeCamera(CameraInfo camera) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text('Remove ${camera.name}?'),
-        content: const Text(
-          'It will be disconnected right away and must be paired again to rejoin.',
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.of(context).pop(true), child: const Text('Remove')),
-        ],
-      ),
+    final confirmed = await showConfirmDialog(
+      context,
+      title: 'Remove ${camera.name}?',
+      message: 'It will be disconnected right away and must be paired again to rejoin.',
+      confirmLabel: 'Remove',
     );
-    if (confirmed != true) return;
+    if (!confirmed) return;
     await _runAction(() => _householdsApi.removeCamera(camera.id), 'Remove failed');
   }
 
@@ -233,18 +210,13 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
   }
 
   Future<void> _confirmSwitchMode() async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Switch modes?'),
-        content: const Text('This device will stop being a viewer and go back to the mode picker. You\'ll stay signed in.'),
-        actions: [
-          TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.of(context).pop(true), child: const Text('Switch')),
-        ],
-      ),
+    final confirmed = await showConfirmDialog(
+      context,
+      title: 'Switch modes?',
+      message: 'This device will stop being a viewer and go back to the mode picker. You\'ll stay signed in.',
+      confirmLabel: 'Switch',
     );
-    if (confirmed == true) widget.onSwitchMode();
+    if (confirmed) widget.onSwitchMode();
   }
 
   @override
@@ -302,7 +274,7 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
             )
           : null,
       body: _connectError != null
-          ? _CenteredMessage(
+          ? MessageView(
               icon: Icons.cloud_off_outlined,
               message: _connectError!,
               action: ElevatedButton(onPressed: _reconnect, child: const Text('Try again')),
@@ -310,7 +282,7 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
           : !_connected
               ? const Center(child: CircularProgressIndicator())
               : _cameras.isEmpty
-                  ? const _CenteredMessage(
+                  ? const MessageView(
                       icon: Icons.videocam_off_outlined,
                       message: 'No cameras yet.\nTap “Add camera”, then scan the code from a phone in Camera Mode.',
                     )
@@ -374,32 +346,6 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
   }
 }
 
-class _CenteredMessage extends StatelessWidget {
-  const _CenteredMessage({required this.icon, required this.message, this.action});
-
-  final IconData icon;
-  final String message;
-  final Widget? action;
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 48, color: Colors.grey),
-            const SizedBox(height: 16),
-            Text(message, textAlign: TextAlign.center),
-            if (action != null) ...[const SizedBox(height: 16), action!],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 /// A camera icon with a small status dot: green while the camera is
 /// connected, grey while it's offline (its motion history is still reachable).
 class _CameraLeadingIcon extends StatelessWidget {
@@ -432,11 +378,11 @@ class _CameraLeadingIcon extends StatelessWidget {
   }
 }
 
+enum _SettingsAction { signOut, switchMode }
+
 /// AppBar action for picking the app's light/dark/system theme. Lives on
 /// Viewer Mode's screens only — Camera Mode runs unattended, so there's no
 /// one around to appreciate a theme switch there.
-enum _SettingsAction { signOut, switchMode }
-
 class _ThemeModeMenu extends StatelessWidget {
   const _ThemeModeMenu({required this.themeController});
 

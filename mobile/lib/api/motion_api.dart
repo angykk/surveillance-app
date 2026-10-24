@@ -27,13 +27,10 @@ class MotionEvent {
   factory MotionEvent.fromJson(Map<dynamic, dynamic> json) => MotionEvent(
         id: json['id'] as String,
         cameraId: json['camera_id'] as String,
-        startedAt: _fromEpochSeconds(json['started_at'] as num),
-        endedAt: json['ended_at'] == null ? null : _fromEpochSeconds(json['ended_at'] as num),
+        startedAt: dateTimeFromEpochSeconds(json['started_at'] as num),
+        endedAt: json['ended_at'] == null ? null : dateTimeFromEpochSeconds(json['ended_at'] as num),
         hasClip: json['has_clip'] as bool? ?? false,
       );
-
-  static DateTime _fromEpochSeconds(num seconds) =>
-      DateTime.fromMillisecondsSinceEpoch((seconds * 1000).round());
 }
 
 /// A camera's motion history and clips. Viewer Mode (a user-signed

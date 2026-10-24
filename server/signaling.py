@@ -1,3 +1,6 @@
+import functools
+import threading
+
 from flask import request
 from flask_socketio import SocketIO, disconnect
 
@@ -15,7 +18,10 @@ socketio = SocketIO()
 #   a publish-only grant;
 # - once the last watcher stops (or drops off), the camera gets
 #   `stream-stop` and leaves the room, so an unwatched camera doesn't keep
-#   uploading video.
+#   uploading video;
+# - a camera that drops out of its room on its own (LiveKit gave up
+#   reconnecting, or joining failed) sends `stream-ended`, and gets a fresh
+#   `stream-start` if anyone is still watching.
 # Any number of viewers can watch one camera at once.
 #
 # Both sides authenticate in the Socket.IO `auth` payload (not query params,
@@ -39,6 +45,20 @@ socketio = SocketIO()
 # instance until it moves to Redis.
 cameras = {}  # device_id -> {'sid': str, 'name': str, 'household_id': str, 'motion_event_id': str | None, 'streaming': bool}
 viewers = {}  # viewer_sid -> {'user_id': str, 'households': set, 'watching': device_id | None}
+
+# Socket events and HTTP requests run on different threads (async_mode
+# 'threading') and all of them read and change `cameras` and `viewers`, so
+# every entry point into this module holds this lock. It's reentrant because
+# a server-side disconnect runs `on_disconnect` right away, on the same thread.
+_lock = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _lock:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def _roster(household_ids):
@@ -79,11 +99,13 @@ def _household_viewer_sids(household_id):
     return [sid for sid, viewer in list(viewers.items()) if household_id in viewer['households']]
 
 
+@_locked
 def broadcast_roster(household_id):
     for viewer_sid in _household_viewer_sids(household_id):
         _send_roster(viewer_sid)
 
 
+@_locked
 def refresh_user_memberships(user_id):
     """Re-reads a connected user's households (e.g. after they create one),
     so their live roster picks up the change without a reconnect."""
@@ -94,21 +116,24 @@ def refresh_user_memberships(user_id):
             _send_roster(viewer_sid)
 
 
+@_locked
 def device_renamed(device_id, household_id, name):
     camera = cameras.get(device_id)
     if camera is not None:
         camera['name'] = name
+        # A rename from Viewer Mode has to reach the camera phone too, which
+        # shows (and saves) its own name.
+        socketio.emit('renamed', {'name': name}, to=camera['sid'])
     broadcast_roster(household_id)
 
 
+@_locked
 def device_revoked(device_id, household_id):
     """Kicks a just-revoked camera off immediately rather than waiting for
     it to reconnect; its token no longer passes `auth.device_for_token`, so
     it can't come back."""
-    camera = cameras.pop(device_id, None)
+    camera = _drop_camera(device_id)
     if camera is not None:
-        _end_motion(device_id, camera)
-        _detach_camera(device_id, notify_viewer=True)
         socketio.server.disconnect(camera['sid'], namespace='/')
     livekit_rooms.close_room(device_id)
     broadcast_roster(household_id)
@@ -126,6 +151,7 @@ def _camera_id_of_sid(sid):
 
 
 @socketio.on('connect')
+@_locked
 def on_connect(auth_payload):
     auth_payload = auth_payload or {}
 
@@ -138,8 +164,10 @@ def on_connect(auth_payload):
         stale = cameras.get(device['id'])
         if stale is not None and stale['sid'] != request.sid:
             print(f"Evicting stale camera {device['id']} ({stale['sid']}), replaced by {request.sid}")
-            _end_motion(device['id'], stale)
-            _detach_camera(device['id'], notify_viewer=True)
+            # Dropped before the disconnect, whose `on_disconnect` runs right
+            # away: otherwise that would mark the camera offline to its
+            # viewers just before it's re-registered.
+            _drop_camera(device['id'])
             disconnect(sid=stale['sid'])
 
         cameras[device['id']] = {
@@ -170,13 +198,12 @@ def on_connect(auth_payload):
 
 
 @socketio.on('disconnect')
+@_locked
 def on_disconnect(*_):
     device_id = _camera_id_of_sid(request.sid)
     if device_id is not None:
-        camera = cameras.pop(device_id)
+        camera = _drop_camera(device_id)
         print(f"Camera '{camera['name']}' ({device_id}) disconnected: {request.sid}")
-        _end_motion(device_id, camera)
-        _detach_camera(device_id, notify_viewer=True)
         _set_last_seen(device_id)
         broadcast_roster(camera['household_id'])
         return
@@ -187,14 +214,19 @@ def on_disconnect(*_):
         _release_stream(viewer['watching'])
 
 
-def _detach_camera(device_id, *, notify_viewer):
-    """Clears any viewer currently watching `device_id`, optionally telling
-    that viewer the camera is gone so it can reset its UI."""
+def _drop_camera(device_id):
+    """Removes a camera from `cameras`, closes its open motion event and
+    tells anyone watching it that it's gone, so they can reset their UI.
+    Returns its entry, or None if it wasn't connected."""
+    camera = cameras.pop(device_id, None)
+    if camera is None:
+        return None
+    _end_motion(device_id, camera)
     for viewer_sid, viewer in viewers.items():
         if viewer['watching'] == device_id:
             viewer['watching'] = None
-            if notify_viewer:
-                socketio.emit('peer-left', to=viewer_sid)
+            socketio.emit('peer-left', to=viewer_sid)
+    return camera
 
 
 def _release_stream(device_id):
@@ -211,6 +243,7 @@ def _release_stream(device_id):
 
 
 @socketio.on('watch-camera')
+@_locked
 def on_watch_camera(data):
     """Acks with a LiveKit grant for the camera's room, or nothing (plus
     `peer-left`) if the camera can't be watched."""
@@ -240,7 +273,24 @@ def on_watch_camera(data):
     return livekit_rooms.viewer_grant(device_id, viewer['user_id'], request.sid)
 
 
+@socketio.on('stream-ended')
+@_locked
+def on_stream_ended():
+    """The camera left its LiveKit room without being told to. Its old grant
+    has likely expired, so a still-watched camera gets a fresh one; without
+    this the camera stayed marked as streaming and was never asked again."""
+    device_id = _camera_id_of_sid(request.sid)
+    if device_id is None:
+        return
+    camera = cameras[device_id]
+    camera['streaming'] = False
+    if any(viewer['watching'] == device_id for viewer in viewers.values()):
+        camera['streaming'] = True
+        socketio.emit('stream-start', livekit_rooms.camera_grant(device_id, camera['name']), to=camera['sid'])
+
+
 @socketio.on('stop-watching')
+@_locked
 def on_stop_watching():
     viewer = viewers.get(request.sid)
     if viewer is None:
@@ -260,6 +310,7 @@ def serialize_motion_event(row):
     }
 
 
+@_locked
 def broadcast_motion(row):
     event = serialize_motion_event(row)
     for viewer_sid in _household_viewer_sids(row['household_id']):
@@ -281,7 +332,17 @@ def _end_motion(device_id, camera):
         broadcast_motion(row)
 
 
+def close_orphaned_motion_events():
+    """Closes motion events left open by a restart or crash mid-motion. Open
+    events are only tracked in `cameras`, so at startup nothing can still be
+    recording into one (the server runs as a single instance)."""
+    closed = db.table('motion_events').update({'ended_at': db.now()}).is_('ended_at', 'null').execute().data
+    if closed:
+        print(f'Closed {len(closed)} motion events left open by the last shutdown')
+
+
 @socketio.on('motion-start')
+@_locked
 def on_motion_start():
     device_id = _camera_id_of_sid(request.sid)
     if device_id is None:
@@ -304,6 +365,7 @@ def on_motion_start():
 
 
 @socketio.on('motion-end')
+@_locked
 def on_motion_end():
     device_id = _camera_id_of_sid(request.sid)
     if device_id is not None:

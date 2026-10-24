@@ -1,9 +1,12 @@
 import os
+import tempfile
 
 from flask import Blueprint, abort, current_app, request, send_from_directory, url_for
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from storage3.exceptions import StorageApiError
 from storage3.types import CreateSignedUploadUrlOptions
+
+import db
 
 # Where motion clips live. The camera uploads each clip straight to storage
 # with a signed URL, and viewers play it back from another signed URL, so
@@ -94,11 +97,21 @@ class LocalStorage:
                 pass
 
     def save(self, key, stream):
+        # Written to a temp file and renamed into place, so an upload that
+        # drops halfway never leaves a truncated clip under the key for a
+        # later `done` to record.
         path = self._path(key)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'wb') as f:
-            while chunk := stream.read(1024 * 1024):
-                f.write(chunk)
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=directory, suffix='.part')
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                while chunk := stream.read(1024 * 1024):
+                    f.write(chunk)
+            os.replace(tmp_path, path)
+        except BaseException:
+            os.remove(tmp_path)
+            raise
 
     def send(self, key):
         directory, filename = os.path.split(self._path(key))
@@ -125,6 +138,11 @@ def local_clip(key):
     if not storage.check(key, op, request.args.get('t', ''), max_age):
         abort(403)
     if op == 'put':
+        # An upload URL outlives its event if retention (or a deletion)
+        # removes the event meanwhile; storing the file then would leave an
+        # object nothing tracks or cleans up.
+        if db.first(db.table('motion_events').select('id').eq('clip_key', key).limit(1).execute()) is None:
+            abort(404)
         storage.save(key, request.stream)
         return '', 200
     if storage.size(key) is None:
