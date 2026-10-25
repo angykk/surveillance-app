@@ -5,6 +5,7 @@ import 'package:video_player/video_player.dart';
 
 import '../api/motion_api.dart';
 import '../signaling/signaling_client.dart';
+import 'app_theme.dart';
 import 'camera_list_screen.dart';
 import 'motion_timeline.dart';
 import 'shared_widgets.dart';
@@ -363,7 +364,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
   /// button and camera name are overlaid on the video instead.
   Widget _buildVideo({required bool landscape}) {
     return ColoredBox(
-      color: Colors.black,
+      color: AppColors.black,
       child: Stack(
         fit: StackFit.expand,
         children: [
@@ -411,33 +412,33 @@ class _ViewerScreenState extends State<ViewerScreen> {
                             child: Text(
                               _camera.name,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                              style: const TextStyle(color: AppColors.white, fontWeight: FontWeight.bold),
                             ),
                           ),
                         if (_clipEvent != null)
                           OverlayPill(padding: _pillPadding, 
-                            icon: const Icon(Icons.history, color: Colors.white, size: 14),
+                            icon: const Icon(Icons.history, color: AppColors.white, size: 14),
                             child: Text(
                               'Clip · ${DateFormat.jm().format(_clipEvent!.startedAt)}',
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                              style: const TextStyle(color: AppColors.white, fontWeight: FontWeight.bold),
                             ),
                           )
                         else if (_isLive)
                           const OverlayPill(padding: _pillPadding, 
-                            icon: Icon(Icons.circle, color: Colors.redAccent, size: 10),
+                            icon: Icon(Icons.circle, color: AppColors.lightRed, size: 10),
                             child: Text(
                               'LIVE',
-                              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                              style: TextStyle(color: AppColors.white, fontWeight: FontWeight.bold),
                             ),
                           ),
                         if (_motionNow)
                           const OverlayPill(padding: _pillPadding, 
-                            icon: PulsingDot(color: Colors.orange, size: 10),
+                            icon: PulsingDot(color: AppColors.taupe, size: 10),
                             child: Text(
                               'Motion now',
                               overflow: TextOverflow.ellipsis,
-                              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                              style: TextStyle(color: AppColors.white, fontWeight: FontWeight.bold),
                             ),
                           ),
                       ],
@@ -446,7 +447,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
                   const SizedBox(width: 8),
                   if (_clipEvent != null) ...[
                     FilledButton.icon(
-                      style: FilledButton.styleFrom(backgroundColor: Colors.black54, foregroundColor: Colors.white),
+                      style: FilledButton.styleFrom(backgroundColor: AppColors.overlay, foregroundColor: AppColors.white),
                       onPressed: _backToLive,
                       icon: const Icon(Icons.sensors),
                       label: const Text('Back to live'),
@@ -479,11 +480,11 @@ class _ClipView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final controller = this.controller;
-    if (controller == null) return const Center(child: CircularProgressIndicator());
+    if (controller == null) return const Center(child: CircularProgressIndicator(color: AppColors.white));
     return ValueListenableBuilder<VideoPlayerValue>(
       valueListenable: controller,
       builder: (context, value, _) {
-        if (!value.isInitialized) return const Center(child: CircularProgressIndicator());
+        if (!value.isInitialized) return const Center(child: CircularProgressIndicator(color: AppColors.white));
         final finished = value.position >= value.duration;
         return Stack(
           fit: StackFit.expand,
@@ -496,11 +497,11 @@ class _ClipView extends StatelessWidget {
               right: 0,
               bottom: 0,
               child: Container(
-                color: Colors.black45,
+                color: AppColors.overlay,
                 child: Row(
                   children: [
                     IconButton(
-                      color: Colors.white,
+                      color: AppColors.white,
                       icon: Icon(value.isPlaying ? Icons.pause : (finished ? Icons.replay : Icons.play_arrow)),
                       onPressed: () {
                         if (value.isPlaying) {
@@ -516,6 +517,11 @@ class _ClipView extends StatelessWidget {
                       child: VideoProgressIndicator(
                         controller,
                         allowScrubbing: true,
+                        colors: VideoProgressColors(
+                          playedColor: AppColors.white,
+                          bufferedColor: AppColors.white.withValues(alpha: 0.3),
+                          backgroundColor: AppColors.white.withValues(alpha: 0.12),
+                        ),
                         padding: const EdgeInsets.symmetric(vertical: 12),
                       ),
                     ),
@@ -523,7 +529,7 @@ class _ClipView extends StatelessWidget {
                       padding: const EdgeInsets.symmetric(horizontal: 12),
                       child: Text(
                         '${_mmss(value.position)} / ${_mmss(value.duration)}',
-                        style: const TextStyle(color: Colors.white70),
+                        style: TextStyle(color: AppColors.white.withValues(alpha: 0.7)),
                       ),
                     ),
                   ],
@@ -555,15 +561,15 @@ class _VideoPlaceholder extends StatelessWidget {
     return MessageView(
       icon: offline ? Icons.videocam_off_outlined : Icons.videocam_outlined,
       iconSize: 40,
-      iconColor: Colors.white54,
+      iconColor: AppColors.white.withValues(alpha: 0.55),
       message: status,
-      textColor: Colors.white70,
+      textColor: AppColors.white.withValues(alpha: 0.7),
       padding: const EdgeInsets.fromLTRB(24, 56, 24, 16),
       actionSpacing: 8,
       action: onRetry == null
           ? null
           : TextButton.icon(
-              style: TextButton.styleFrom(foregroundColor: Colors.white),
+              style: TextButton.styleFrom(foregroundColor: AppColors.white),
               onPressed: onRetry,
               icon: const Icon(Icons.refresh),
               label: const Text('Try again'),

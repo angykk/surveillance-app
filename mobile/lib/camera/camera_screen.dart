@@ -13,6 +13,7 @@ import '../api/api_client.dart';
 import '../api/motion_api.dart';
 import '../config.dart';
 import '../motion/motion_detector.dart';
+import '../ui/app_theme.dart';
 import '../ui/rename_dialog.dart';
 import '../ui/shared_widgets.dart';
 import '../signaling/signaling_client.dart';
@@ -628,7 +629,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         if (!didPop) _confirmSwitchMode();
       },
       child: Scaffold(
-        backgroundColor: Colors.black,
+        backgroundColor: AppColors.black,
         body: Stack(
           fit: StackFit.expand,
           children: [
@@ -650,17 +651,17 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                             child: Text(
                               _credentials.name,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                              style: const TextStyle(color: AppColors.white, fontWeight: FontWeight.bold),
                             ),
                           ),
                         ),
                         if (ready && _isLiveToViewer) ...[
                           const SizedBox(width: 8),
                           const OverlayPill(
-                            icon: Icon(Icons.wifi_tethering, color: Colors.greenAccent, size: 14),
+                            icon: Icon(Icons.wifi_tethering, color: AppColors.lightRed, size: 14),
                             child: Text(
                               'LIVE',
-                              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                              style: TextStyle(color: AppColors.white, fontWeight: FontWeight.bold),
                             ),
                           ),
                         ],
@@ -668,8 +669,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                           const SizedBox(width: 8),
                           Flexible(
                             child: OverlayPill(
-                              icon: const Icon(Icons.cloud_off, color: Colors.white70, size: 14),
-                              child: Text(_connectionProblem!, style: const TextStyle(color: Colors.white70)),
+                              icon: Icon(Icons.cloud_off, color: AppColors.white.withValues(alpha: 0.7), size: 14),
+                              child: Text(_connectionProblem!, style: TextStyle(color: AppColors.white.withValues(alpha: 0.7))),
                             ),
                           ),
                         ],
@@ -678,10 +679,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                     const Spacer(),
                     if (ready && _motionActive)
                       const OverlayPill(
-                        icon: Icon(Icons.directions_run, color: Colors.orangeAccent, size: 14),
+                        icon: Icon(Icons.directions_run, color: AppColors.taupe, size: 14),
                         child: Text(
                           'MOTION · REC',
-                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                          style: TextStyle(color: AppColors.white, fontWeight: FontWeight.bold),
                         ),
                       ),
                   ],
@@ -697,7 +698,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   Widget _buildBody() {
     switch (_status) {
       case _Status.initializing:
-        return const Center(child: CircularProgressIndicator());
+        return const Center(child: CircularProgressIndicator(color: AppColors.white));
       case _Status.permissionDenied:
         return _message(
           icon: Icons.no_photography,
@@ -733,7 +734,7 @@ Widget _message({
     MessageView(
       icon: icon,
       message: message,
-      textColor: Colors.white,
+      textColor: AppColors.white,
       padding: const EdgeInsets.fromLTRB(24, 72, 24, 24),
       action: ElevatedButton(onPressed: onAction, child: Text(actionLabel)),
     );

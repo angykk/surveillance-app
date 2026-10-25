@@ -6,6 +6,7 @@ import '../auth/session.dart';
 import '../api/motion_api.dart';
 import '../config.dart';
 import '../signaling/signaling_client.dart';
+import 'app_theme.dart';
 import 'pairing_code_screen.dart';
 import 'rename_dialog.dart';
 import 'shared_widgets.dart';
@@ -367,7 +368,7 @@ class _CameraLeadingIcon extends StatelessWidget {
             width: 12,
             height: 12,
             decoration: BoxDecoration(
-              color: online ? Colors.green : colors.outline,
+              color: online ? AppColors.online : colors.outline,
               shape: BoxShape.circle,
               border: Border.all(color: colors.surface, width: 2),
             ),

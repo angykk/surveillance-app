@@ -8,6 +8,7 @@ import 'config.dart';
 import 'ui/app_mode_controller.dart';
 import 'ui/mode_select_screen.dart';
 import 'ui/theme_controller.dart';
+import 'ui/app_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -79,12 +80,8 @@ class _MainAppState extends State<MainApp> {
       builder: (context, themeMode, _) {
         return MaterialApp(
           title: 'Repurposed Security Camera',
-          theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
-          darkTheme: ThemeData(
-            colorSchemeSeed: Colors.indigo,
-            brightness: Brightness.dark,
-            useMaterial3: true,
-          ),
+          theme: AppTheme.light,
+          darkTheme: AppTheme.dark,
           themeMode: themeMode,
           home: _buildHome(),
         );

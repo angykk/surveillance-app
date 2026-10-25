@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'app_theme.dart';
+
 /// A translucent rounded label for text over a camera feed.
 class OverlayPill extends StatelessWidget {
   const OverlayPill({
@@ -17,7 +19,7 @@ class OverlayPill extends StatelessWidget {
   Widget build(BuildContext context) {
     return Container(
       padding: padding,
-      decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(20)),
+      decoration: BoxDecoration(color: AppColors.overlay, borderRadius: BorderRadius.circular(20)),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -40,7 +42,7 @@ class OverlayButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return IconButton.filled(
-      style: IconButton.styleFrom(backgroundColor: Colors.black54, foregroundColor: Colors.white),
+      style: IconButton.styleFrom(backgroundColor: AppColors.overlay, foregroundColor: AppColors.white),
       icon: Icon(icon),
       tooltip: tooltip,
       onPressed: onPressed,
@@ -57,7 +59,7 @@ class MessageView extends StatelessWidget {
     required this.message,
     this.icon,
     this.iconSize = 48,
-    this.iconColor = Colors.grey,
+    this.iconColor,
     this.textColor,
     this.action,
     this.actionSpacing = 16,
@@ -67,7 +69,8 @@ class MessageView extends StatelessWidget {
   final String message;
   final IconData? icon;
   final double iconSize;
-  final Color iconColor;
+  /// Null for the theme's outline color.
+  final Color? iconColor;
 
   /// Null for the theme's text color.
   final Color? textColor;
@@ -84,7 +87,7 @@ class MessageView extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             if (icon != null) ...[
-              Icon(icon, size: iconSize, color: iconColor),
+              Icon(icon, size: iconSize, color: iconColor ?? Theme.of(context).colorScheme.outline),
               SizedBox(height: iconSize / 3),
             ],
             Text(message, textAlign: TextAlign.center, style: TextStyle(color: textColor)),

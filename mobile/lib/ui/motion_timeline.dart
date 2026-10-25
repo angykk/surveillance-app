@@ -147,7 +147,7 @@ class _EventTile extends StatelessWidget {
       selectedTileColor: colors.secondaryContainer,
       onTap: onTap,
       leading: event.ongoing
-          ? const PulsingDot(color: Colors.orange)
+          ? PulsingDot(color: colors.error)
           : Icon(
               event.hasClip ? Icons.play_circle_outline : Icons.directions_run,
               color: event.hasClip ? colors.primary : colors.outline,
@@ -156,7 +156,7 @@ class _EventTile extends StatelessWidget {
       subtitle: clipNote == null ? null : Text(clipNote),
       trailing: Text(
         endedAt == null ? 'Ongoing' : _formatDuration(endedAt.difference(event.startedAt)),
-        style: TextStyle(color: event.ongoing ? Colors.orange : colors.onSurfaceVariant),
+        style: TextStyle(color: event.ongoing ? colors.error : colors.onSurfaceVariant),
       ),
     );
   }

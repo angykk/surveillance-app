@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import '../api/households_api.dart';
+import 'app_theme.dart';
 
 /// "Add camera": shows a short-lived pairing code as a QR for the new
 /// camera phone to scan in Camera Mode. The camera shows up in the camera
@@ -97,7 +98,7 @@ class _PairingCodeScreenState extends State<PairingCodeScreen> {
       child: Container(
         // QR scanners need dark-on-light with a quiet zone, whatever the
         // app's theme is.
-        color: Colors.white,
+        color: AppColors.white,
         padding: const EdgeInsets.all(16),
         child: QrImageView(data: code.qrPayload, size: 240),
       ),
