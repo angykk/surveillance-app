@@ -79,7 +79,7 @@ class _MainAppState extends State<MainApp> {
       valueListenable: _themeController,
       builder: (context, themeMode, _) {
         return MaterialApp(
-          title: 'Repurposed Security Camera',
+          title: 'KeepWatch',
           theme: AppTheme.light,
           darkTheme: AppTheme.dark,
           themeMode: themeMode,

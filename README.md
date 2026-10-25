@@ -1,4 +1,4 @@
-# Surveillance App
+# KeepWatch
 
 Turn a spare phone into a security camera and watch it from another phone.
 

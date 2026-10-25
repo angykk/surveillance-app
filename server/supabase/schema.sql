@@ -1,4 +1,4 @@
--- Schema for the surveillance app server. Run once in the Supabase dashboard
+-- Schema for the KeepWatch server. Run once in the Supabase dashboard
 -- (SQL Editor → New query → paste → Run). Safe to re-run.
 --
 -- Everything a user can see is scoped by household: a user reaches cameras
