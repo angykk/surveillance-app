@@ -12,10 +12,12 @@ import db
 # with a signed URL, and viewers play it back from another signed URL, so
 # video bytes never pass through this server (with Supabase Storage).
 #
-# Keys look like `households/<hid>/devices/<did>/<event id>.mp4`, all
+# Each motion event can have a clip and a thumbnail (a still of the moment
+# motion started, for the viewer's timeline). Keys look like
+# `households/<hid>/devices/<did>/<event id>.mp4` (or `.jpg`), all
 # server-issued ids, so they're always safe as paths.
 #
-# Two backends behind the same four calls:
+# Two backends behind the same five calls:
 # - SupabaseStorage: a private bucket in the Supabase project (production).
 # - LocalStorage: files under RECORDINGS_DIR, with this server handing out
 #   and serving the signed URLs itself (local SQLite testing and pytest).
@@ -26,6 +28,21 @@ PLAYBACK_URL_TTL_S = 3600
 
 def clip_key(event):
     return f"households/{event['household_id']}/devices/{event['device_id']}/{event['id']}.mp4"
+
+
+def thumbnail_key(event):
+    return f"households/{event['household_id']}/devices/{event['device_id']}/{event['id']}.jpg"
+
+
+def thumbnail_urls(rows):
+    """Signed URLs for the thumbnails of these motion events, keyed by event
+    id; events without an uploaded thumbnail are left out. One storage call
+    for the lot, since a timeline loads up to hundreds of events."""
+    keys = {row['id']: row['thumb_key'] for row in rows if row.get('thumb_size_bytes') is not None}
+    if not keys:
+        return {}
+    urls = get().playback_urls(list(keys.values()))
+    return {event_id: urls[key] for event_id, key in keys.items() if urls.get(key)}
 
 
 class SupabaseStorage:
@@ -52,6 +69,11 @@ class SupabaseStorage:
 
     def playback_url(self, key):
         return self._bucket.create_signed_url(key, PLAYBACK_URL_TTL_S)['signedURL']
+
+    def playback_urls(self, keys):
+        """Signed URLs for several objects in one call, keyed by key."""
+        signed = self._bucket.create_signed_urls(keys, PLAYBACK_URL_TTL_S)
+        return {item['path']: item['signedURL'] for item in signed if not item.get('error')}
 
     def delete(self, keys):
         if keys:
@@ -88,6 +110,9 @@ class LocalStorage:
 
     def playback_url(self, key):
         return self._url(key, 'get')
+
+    def playback_urls(self, keys):
+        return {key: self._url(key, 'get') for key in keys}
 
     def delete(self, keys):
         for key in keys:
@@ -141,7 +166,10 @@ def local_clip(key):
         # An upload URL outlives its event if retention (or a deletion)
         # removes the event meanwhile; storing the file then would leave an
         # object nothing tracks or cleans up.
-        if db.first(db.table('motion_events').select('id').eq('clip_key', key).limit(1).execute()) is None:
+        if not any(
+            db.first(db.table('motion_events').select('id').eq(column, key).limit(1).execute())
+            for column in ('clip_key', 'thumb_key')
+        ):
             abort(404)
         storage.save(key, request.stream)
         return '', 200

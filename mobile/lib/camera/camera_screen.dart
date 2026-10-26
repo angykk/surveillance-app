@@ -20,6 +20,7 @@ import '../signaling/signaling_client.dart';
 import 'clip_upload_queue.dart';
 import 'device_credentials.dart';
 import 'serial_task.dart';
+import 'thumbnail.dart';
 
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key, required this.credentials, required this.onUnpaired, required this.onSwitchMode});
@@ -334,12 +335,13 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         return;
       }
       _stalledCaptures = 0;
-      final motionDetected = await _motionDetector.detect(frame.asUint8List());
+      final frameBytes = frame.asUint8List();
+      final motionDetected = await _motionDetector.detect(frameBytes);
       if (_videoTrack != track) return;
 
       if (motionDetected) {
         _lastMotionAt = DateTime.now();
-        if (!_motionActive) await _startMotion();
+        if (!_motionActive) await _startMotion(frameBytes);
       } else if (_motionActive) {
         final last = _lastMotionAt;
         if (last != null && DateTime.now().difference(last) >= _motionCooldown) {
@@ -367,10 +369,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
   }
 
-  /// Reports motion to the server and records a clip of it. The event id the
-  /// clip belongs to comes back in `motion-start`'s ack, long before the clip
+  /// Reports motion to the server and records a clip of it, with [frame]
+  /// (the one the motion was seen in) as the event's thumbnail. The event id
+  /// they belong to comes back in `motion-start`'s ack, long before the clip
   /// is finished.
-  Future<void> _startMotion() async {
+  Future<void> _startMotion(Uint8List frame) async {
     final track = _videoTrack;
     if (track == null || _motionActive) return;
     setState(() => _motionActive = true);
@@ -387,6 +390,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _signaling.socket.emitWithAck('motion-start', null, ack: (data) {
       if (!clip.eventId.isCompleted) clip.eventId.complete(data is Map ? data['id'] as String? : null);
     });
+    unawaited(_queueThumbnail(clip, frame));
     await clip.recorder.start(
       clip.file.path,
       videoTrack: track.mediaStreamTrack,
@@ -423,6 +427,22 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       await _clipQueue.discard(clip.file);
     } else {
       await _clipQueue.add(clip.file, eventId);
+    }
+  }
+
+  /// Shrinks [frame] into the event's thumbnail and queues it for upload.
+  /// Best-effort: an event without one just shows a placeholder.
+  Future<void> _queueThumbnail(_Clip clip, Uint8List frame) async {
+    try {
+      final results = await Future.wait([
+        encodeThumbnail(frame),
+        clip.eventId.future.timeout(_eventIdTimeout, onTimeout: () => null),
+      ]);
+      final jpeg = results[0] as Uint8List?;
+      final eventId = results[1] as String?;
+      if (jpeg != null && eventId != null) await _clipQueue.addThumbnail(jpeg, eventId);
+    } catch (e) {
+      debugPrint('Making a motion thumbnail failed: $e');
     }
   }
 

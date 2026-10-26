@@ -141,22 +141,93 @@ class _EventTile extends StatelessWidget {
     } else {
       clipNote = DateTime.now().difference(endedAt!) < _clipUploadGrace ? 'Saving clip…' : 'No clip';
     }
-    return ListTile(
-      dense: true,
-      selected: selected,
-      selectedTileColor: colors.secondaryContainer,
-      onTap: onTap,
-      leading: event.ongoing
-          ? PulsingDot(color: colors.error)
-          : Icon(
-              event.hasClip ? Icons.play_circle_outline : Icons.directions_run,
-              color: event.hasClip ? colors.primary : colors.outline,
-            ),
-      title: Text(DateFormat.jm().format(event.startedAt)),
-      subtitle: clipNote == null ? null : Text(clipNote),
-      trailing: Text(
-        endedAt == null ? 'Ongoing' : _formatDuration(endedAt.difference(event.startedAt)),
-        style: TextStyle(color: event.ongoing ? colors.error : colors.onSurfaceVariant),
+    final textTheme = Theme.of(context).textTheme;
+    return Material(
+      color: selected ? colors.secondaryContainer : Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          child: Row(
+            children: [
+              _Thumbnail(event: event),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      DateFormat.jm().format(event.startedAt),
+                      style: textTheme.bodyLarge?.copyWith(color: selected ? colors.onSecondaryContainer : null),
+                    ),
+                    if (clipNote != null)
+                      Text(clipNote, style: textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+              Text(
+                endedAt == null ? 'Ongoing' : _formatDuration(endedAt.difference(event.startedAt)),
+                style: TextStyle(color: event.ongoing ? colors.error : colors.onSurfaceVariant),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The still of the moment motion started, with a pulsing dot while the
+/// motion lasts and a play badge once there's a clip. Before the thumbnail
+/// arrives (or if it never does, or its signed URL has expired) it shows a
+/// placeholder icon instead.
+class _Thumbnail extends StatelessWidget {
+  const _Thumbnail({required this.event});
+
+  final MotionEvent event;
+
+  static const _width = 96.0;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    final placeholder = Center(child: Icon(Icons.directions_run, color: colors.outline));
+    final url = event.thumbnailUrl;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: SizedBox(
+        width: _width,
+        height: _width * 9 / 16,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            ColoredBox(color: colors.surfaceContainerHighest),
+            if (url == null)
+              placeholder
+            else
+              Image.network(
+                url.toString(),
+                fit: BoxFit.cover,
+                cacheWidth: (_width * MediaQuery.devicePixelRatioOf(context)).round(),
+                // A refresh re-signs the URL; keep showing the old image
+                // while the new one loads rather than flashing blank.
+                gaplessPlayback: true,
+                errorBuilder: (_, _, _) => placeholder,
+              ),
+            if (event.ongoing)
+              Positioned(top: 6, left: 6, child: PulsingDot(color: colors.error, size: 10)),
+            if (event.hasClip)
+              Center(
+                child: DecoratedBox(
+                  decoration: const BoxDecoration(color: Colors.black54, shape: BoxShape.circle),
+                  child: const Padding(
+                    padding: EdgeInsets.all(2),
+                    child: Icon(Icons.play_arrow, color: Colors.white, size: 20),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }

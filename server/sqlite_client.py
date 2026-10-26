@@ -54,17 +54,23 @@ create table if not exists motion_events (
   started_at real not null,
   ended_at real,
   clip_key text,
-  clip_size_bytes integer
+  clip_size_bytes integer,
+  thumb_key text,
+  thumb_size_bytes integer
 );
 create table if not exists clip_deletions (
   clip_key text primary key,
   queued_at real not null
 );
-create trigger if not exists motion_events_queue_clip_deletion
+drop trigger if exists motion_events_queue_clip_deletion;
+create trigger motion_events_queue_clip_deletion
 after delete on motion_events
-when old.clip_key is not null
+when old.clip_key is not null or old.thumb_key is not null
 begin
-  insert or ignore into clip_deletions (clip_key, queued_at) values (old.clip_key, (julianday('now') - 2440587.5) * 86400.0);
+  insert or ignore into clip_deletions (clip_key, queued_at)
+  select old.clip_key, (julianday('now') - 2440587.5) * 86400.0 where old.clip_key is not null;
+  insert or ignore into clip_deletions (clip_key, queued_at)
+  select old.thumb_key, (julianday('now') - 2440587.5) * 86400.0 where old.thumb_key is not null;
 end;
 '''
 
@@ -82,7 +88,17 @@ class SQLiteClient:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._conn.execute('pragma foreign_keys = on')
+        self._add_missing_columns()
         self._conn.executescript(SCHEMA)
+
+    def _add_missing_columns(self):
+        """Brings a database made before thumbnails up to date; `create table
+        if not exists` leaves an existing table as it was."""
+        columns = {row['name'] for row in self._conn.execute('pragma table_info(motion_events)')}
+        if columns:
+            for column, kind in (('thumb_key', 'text'), ('thumb_size_bytes', 'integer')):
+                if column not in columns:
+                    self._conn.execute(f'alter table motion_events add column {column} {kind}')
 
     def table(self, name):
         return _Query(self, name)

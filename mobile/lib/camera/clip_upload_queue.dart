@@ -7,10 +7,11 @@ import 'package:path_provider/path_provider.dart';
 import '../api/api_client.dart';
 import '../api/motion_api.dart';
 
-/// Motion clips waiting to be uploaded, kept on disk until the server has
-/// them, so a dropped connection or a server restart doesn't lose a clip.
+/// Motion clips and thumbnails waiting to be uploaded, kept on disk until
+/// the server has them, so a dropped connection or a server restart doesn't
+/// lose one.
 ///
-/// Each clip is a file named `<event id>.mp4` in an app-support folder
+/// Each is a file named `<event id>.mp4` (or `.jpg`) in an app-support folder
 /// (which, unlike the temp folder, the OS doesn't clear), so the queue
 /// survives the app being killed. Uploads go one at a time, oldest first,
 /// whenever [drain] runs: after a clip is added, when the camera's socket
@@ -65,7 +66,7 @@ class ClipUploadQueue {
   Future<void> add(File recording, String eventId) async {
     final dir = await _folder();
     try {
-      await recording.rename('${dir.path}/$eventId.mp4');
+      await recording.rename('${dir.path}/$eventId$_clipExtension');
     } catch (e) {
       debugPrint('Queuing clip for $eventId failed: $e');
       await _delete(recording);
@@ -75,6 +76,22 @@ class ClipUploadQueue {
   }
 
   Future<void> discard(File recording) => _delete(recording);
+
+  /// Queues [jpeg] as [eventId]'s thumbnail and starts uploading. It's
+  /// written when motion starts, so it goes up ahead of the event's clip.
+  Future<void> addThumbnail(Uint8List jpeg, String eventId) async {
+    final dir = await _folder();
+    try {
+      await File('${dir.path}/$eventId$_thumbnailExtension').writeAsBytes(jpeg, flush: true);
+    } catch (e) {
+      debugPrint('Queuing thumbnail for $eventId failed: $e');
+      return;
+    }
+    unawaited(drain());
+  }
+
+  static const _clipExtension = '.mp4';
+  static const _thumbnailExtension = '.jpg';
 
   /// Uploads every queued clip it can, after dropping the oldest if the
   /// queue is over [maxBytes]. Safe to call any time: overlapping calls fold
@@ -103,13 +120,19 @@ class ClipUploadQueue {
     }
   }
 
-  /// Uploads one clip, removing it once the server has it or can never
-  /// take it. Returns false to stop draining (a network or server problem
-  /// that will hit the rest of the queue too).
+  /// Uploads one clip or thumbnail, removing it once the server has it or
+  /// can never take it. Returns false to stop draining (a network or server
+  /// problem that will hit the rest of the queue too).
   Future<bool> _upload(File clip) async {
-    final eventId = clip.uri.pathSegments.last.replaceAll('.mp4', '');
+    final name = clip.uri.pathSegments.last;
+    final isThumbnail = name.endsWith(_thumbnailExtension);
+    final eventId = name.substring(0, name.lastIndexOf('.'));
     try {
-      await _motionApi.uploadClip(eventId, clip);
+      if (isThumbnail) {
+        await _motionApi.uploadThumbnail(eventId, clip);
+      } else {
+        await _motionApi.uploadClip(eventId, clip);
+      }
     } on ApiException catch (e) {
       if (!_isPermanent(e.statusCode)) {
         debugPrint('Clip upload for $eventId failed, will retry: $e');
@@ -131,20 +154,28 @@ class ClipUploadQueue {
   static bool _isPermanent(int status) =>
       status >= 400 && status < 500 && status != 401 && status != 408 && status != 429;
 
-  /// Queued clips, oldest first. A clip deleted while this looks (e.g. a
+  /// Queued clips and thumbnails, oldest first. A clip deleted while this looks (e.g. a
   /// [discard], or one the server just took) is left out.
   Future<List<File>> _queued() async {
     final dir = await _folder();
     final modified = <File, DateTime>{};
     await for (final entity in dir.list()) {
-      if (entity is! File || !entity.path.endsWith('.mp4') || _isRecording(entity)) continue;
+      if (entity is! File || _isRecording(entity)) continue;
+      if (!entity.path.endsWith(_clipExtension) && !entity.path.endsWith(_thumbnailExtension)) continue;
       try {
         modified[entity] = await entity.lastModified();
       } on FileSystemException {
         continue;
       }
     }
-    return modified.keys.toList()..sort((a, b) => modified[a]!.compareTo(modified[b]!));
+    // On a tie (timestamps can be whole seconds), thumbnails first: they're
+    // small, and what a viewer sees first.
+    int rank(File f) => f.path.endsWith(_thumbnailExtension) ? 0 : 1;
+    return modified.keys.toList()
+      ..sort((a, b) {
+        final byAge = modified[a]!.compareTo(modified[b]!);
+        return byAge != 0 ? byAge : rank(a).compareTo(rank(b));
+      });
   }
 
   Future<void> _enforceLimit() async {

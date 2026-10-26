@@ -76,13 +76,18 @@ def pair_camera(client, user_id, name='Front Door', household_id=None):
     return client.post('/devices/pair', json={'code': code, 'name': name}).get_json()
 
 
-def upload_clip(client, device_token, event_id, data=b'fake mp4 bytes'):
-    """Attaches a clip the way the camera does: ask for a signed upload URL,
-    PUT the file to it, then report it done. Returns the first response that
-    isn't a success, or the final `done` response."""
-    resp = client.post(f'/motion-events/{event_id}/clip/upload', headers=as_device(device_token))
+def upload_clip(client, device_token, event_id, data=b'fake mp4 bytes', kind='clip'):
+    """Attaches a clip (or a thumbnail) the way the camera does: ask for a
+    signed upload URL, PUT the file to it, then report it done. Returns the
+    first response that isn't a success, or the final `done` response."""
+    resp = client.post(f'/motion-events/{event_id}/{kind}/upload', headers=as_device(device_token))
     if resp.status_code != 200:
         return resp
-    put = client.put(resp.get_json()['url'], data=data, content_type='video/mp4')
+    content_type = 'video/mp4' if kind == 'clip' else 'image/jpeg'
+    put = client.put(resp.get_json()['url'], data=data, content_type=content_type)
     assert put.status_code == 200
-    return client.post(f'/motion-events/{event_id}/clip/done', headers=as_device(device_token))
+    return client.post(f'/motion-events/{event_id}/{kind}/done', headers=as_device(device_token))
+
+
+def upload_thumbnail(client, device_token, event_id, data=b'fake jpeg bytes'):
+    return upload_clip(client, device_token, event_id, data, kind='thumbnail')

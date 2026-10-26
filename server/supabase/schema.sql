@@ -62,7 +62,9 @@ create index if not exists pairing_codes_created_by_idx on public.pairing_codes 
 -- each event and uploads it to the `clips` Storage bucket once the event
 -- ends. clip_key is set when the camera asks for an upload URL, and
 -- clip_size_bytes once the upload is confirmed, which is what makes the
--- event playable; both stay null if no upload ever arrives.
+-- event playable; both stay null if no upload ever arrives. thumb_key and
+-- thumb_size_bytes work the same way for the event's thumbnail, a still of
+-- the moment motion started that the camera uploads right away.
 create table if not exists public.motion_events (
   id uuid primary key,
   device_id uuid not null references public.devices (id) on delete cascade,
@@ -70,13 +72,18 @@ create table if not exists public.motion_events (
   started_at double precision not null,
   ended_at double precision,
   clip_key text,
-  clip_size_bytes bigint
+  clip_size_bytes bigint,
+  thumb_key text,
+  thumb_size_bytes bigint
 );
+-- For a table created before thumbnails were added.
+alter table public.motion_events add column if not exists thumb_key text;
+alter table public.motion_events add column if not exists thumb_size_bytes bigint;
 create index if not exists motion_events_device_id_started_at_idx on public.motion_events (device_id, started_at desc);
 create index if not exists motion_events_household_id_idx on public.motion_events (household_id);
 
--- Storage keys of clips whose motion event is gone, waiting for the
--- server's retention job to delete them from the bucket. A trigger fills
+-- Storage keys of clips and thumbnails whose motion event is gone, waiting
+-- for the server's retention job to delete them from the bucket. A trigger fills
 -- it, so cascades the server never sees (a deleted household, or a user
 -- deleted in Supabase Auth) still get their clips cleaned up.
 create table if not exists public.clip_deletions (
@@ -95,7 +102,9 @@ set search_path = ''
 as $$
 begin
   insert into public.clip_deletions (clip_key, queued_at)
-  values (old.clip_key, extract(epoch from now()))
+  select key, extract(epoch from now())
+  from (values (old.clip_key), (old.thumb_key)) as keys (key)
+  where key is not null
   on conflict (clip_key) do nothing;
   return old;
 end;
@@ -105,18 +114,19 @@ drop trigger if exists motion_events_queue_clip_deletion on public.motion_events
 create trigger motion_events_queue_clip_deletion
 after delete on public.motion_events
 for each row
-when (old.clip_key is not null)
+when (old.clip_key is not null or old.thumb_key is not null)
 execute function public.queue_clip_deletion();
 
 -- Trigger functions can't be called directly, but keep it off the
 -- client-facing roles like every other function here.
 revoke execute on function public.queue_clip_deletion () from public, anon, authenticated;
 
--- The private bucket clips live in. Only the server (secret key) can reach
--- it; cameras and viewers get short-lived signed URLs for one object each.
+-- The private bucket clips and thumbnails live in. Only the server (secret
+-- key) can reach it; cameras and viewers get short-lived signed URLs for one
+-- object each.
 insert into storage.buckets (id, name, public, allowed_mime_types)
-values ('clips', 'clips', false, array['video/mp4'])
-on conflict (id) do nothing;
+values ('clips', 'clips', false, array['video/mp4', 'image/jpeg'])
+on conflict (id) do update set allowed_mime_types = excluded.allowed_mime_types;
 
 -- The `public` schema is reachable through Supabase's Data API by anyone
 -- holding the publishable key, which ships inside the mobile app. RLS with

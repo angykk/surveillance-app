@@ -1,10 +1,12 @@
 import os
+import sqlite3
 import time
 
 import db
 import retention
 import signaling
-from conftest import as_device, as_user, home_household, pair_camera, upload_clip, user_token
+import sqlite_client
+from conftest import as_device, as_user, home_household, pair_camera, upload_clip, upload_thumbnail, user_token
 
 
 def test_requests_without_valid_token_are_rejected(client):
@@ -162,6 +164,60 @@ def test_cascaded_deletes_still_clean_up_clips(app, client):
 
     retention.run_once(0, app.extensions['clip_storage'])
     assert _stored_keys(app) == []
+
+
+def test_thumbnails_show_on_the_timeline_before_the_clip(app, client):
+    alice_cam = pair_camera(client, 'alice')
+    bob_cam = pair_camera(client, 'bob', name='Garage')
+    viewer = signaling.socketio.test_client(app, auth={'token': user_token('alice')})
+    camera = signaling.socketio.test_client(app, auth={'device_token': alice_cam['device_token']})
+    # Uploaded as soon as motion starts, while the event is still ongoing.
+    event_id = camera.emit('motion-start', callback=True)['id']
+
+    [event] = _motion_events(client, 'alice', alice_cam['device_id']).get_json()
+    assert event['thumbnail_url'] is None
+    assert upload_thumbnail(client, bob_cam['device_token'], event_id).status_code == 404
+    viewer.get_received()
+    assert upload_thumbnail(client, alice_cam['device_token'], event_id).status_code == 204
+    assert upload_thumbnail(client, alice_cam['device_token'], event_id).status_code == 409
+
+    # Open timelines get it live, and a reload gets it with the history.
+    [pushed] = [m['args'][0] for m in viewer.get_received() if m['name'] == 'motion']
+    [event] = _motion_events(client, 'alice', alice_cam['device_id']).get_json()
+    for url in (pushed['thumbnail_url'], event['thumbnail_url']):
+        assert client.get(url).data == b'fake jpeg bytes'
+    assert event['ended_at'] is None and event['has_clip'] is False
+
+    # Still there once the clip arrives.
+    camera.emit('motion-end')
+    assert upload_clip(client, alice_cam['device_token'], event_id).status_code == 204
+    [event] = _motion_events(client, 'alice', alice_cam['device_id']).get_json()
+    assert event['has_clip'] is True and event['thumbnail_url'] is not None
+
+
+def test_deleting_an_event_cleans_up_its_thumbnail(app, client):
+    cam = pair_camera(client, 'alice')
+    event_id = _motion_event(app, cam['device_token'])
+    assert upload_thumbnail(client, cam['device_token'], event_id).status_code == 204
+    assert upload_clip(client, cam['device_token'], event_id).status_code == 204
+    assert sorted(os.path.basename(k) for k in _stored_keys(app)) == [f'{event_id}.jpg', f'{event_id}.mp4']
+
+    db.table('motion_events').delete().eq('id', event_id).execute()
+    retention.run_once(0, app.extensions['clip_storage'])
+    assert _stored_keys(app) == []
+
+
+def test_thumbnail_columns_are_added_to_an_older_local_database(tmp_path):
+    path = str(tmp_path / 'old.db')
+    conn = sqlite3.connect(path)
+    conn.execute(
+        'create table motion_events (id text primary key, device_id text not null, household_id text not null,'
+        ' started_at real not null, ended_at real, clip_key text, clip_size_bytes integer)'
+    )
+    conn.close()
+    client = sqlite_client.SQLiteClient(path)
+    columns = {row['name'] for row in client._run('pragma table_info(motion_events)')}
+    assert {'thumb_key', 'thumb_size_bytes'} <= columns
 
 
 def test_revoked_device_token_stops_working(client):

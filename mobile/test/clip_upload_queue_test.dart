@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mobile/api/api_client.dart';
@@ -24,6 +25,10 @@ class _FakeMotionApi implements MotionApi {
       existedAtEnd[eventId] = file.existsSync();
     }
   }
+
+  /// Thumbnail uploads, which go in [uploads] too, as `<event id>.jpg`.
+  @override
+  Future<void> uploadThumbnail(String eventId, File file) => uploadClip('$eventId.jpg', file);
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
@@ -145,6 +150,32 @@ void main() {
     await q.discard(b);
     release.complete();
     await expectLater(drained, completes);
+  });
+
+  test("uploads an event's thumbnail ahead of its clip, and both share its retry rules", () async {
+    final q = queue();
+    api.respond = (_) async => throw const SocketException('offline');
+    await q.addThumbnail(Uint8List.fromList([1, 2, 3]), 'a');
+    await settle();
+    await q.add(await recording(q), 'a');
+    await settle();
+    expect(queuedIds(), ['a', 'a.jpg']);
+    expect(File('${base.path}/pending-clips/a.jpg').readAsBytesSync(), [1, 2, 3]);
+
+    api.uploads.clear();
+    api.respond = (_) async {};
+    await q.drain();
+    expect(api.uploads, ['a.jpg', 'a']);
+    expect(queuedIds(), isEmpty);
+  });
+
+  test('drops a thumbnail the server can never take', () async {
+    final q = queue();
+    api.respond = (_) async => throw ApiException(409, 'already has one');
+    await q.addThumbnail(Uint8List.fromList([0]), 'a');
+    await settle();
+    expect(api.uploads, ['a.jpg']);
+    expect(queuedIds(), isEmpty);
   });
 
   test('leftover in-progress recordings are cleared on start', () async {

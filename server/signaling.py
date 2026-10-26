@@ -5,6 +5,7 @@ from flask import request
 from flask_socketio import SocketIO, disconnect
 
 import auth
+import clip_storage
 import db
 import livekit_rooms
 
@@ -300,19 +301,21 @@ def on_stop_watching():
     _release_stream(previous)
 
 
-def serialize_motion_event(row):
+def serialize_motion_event(row, thumbnail_url=None):
     return {
         'id': row['id'],
         'camera_id': row['device_id'],
         'started_at': row['started_at'],
         'ended_at': row['ended_at'],
         'has_clip': row.get('clip_size_bytes') is not None,
+        # Signed, and short-lived like a clip's playback URL.
+        'thumbnail_url': thumbnail_url,
     }
 
 
 @_locked
 def broadcast_motion(row):
-    event = serialize_motion_event(row)
+    event = serialize_motion_event(row, clip_storage.thumbnail_urls([row]).get(row['id']))
     for viewer_sid in _household_viewer_sids(row['household_id']):
         socketio.emit('motion', event, to=viewer_sid)
 

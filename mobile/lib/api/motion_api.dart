@@ -6,7 +6,9 @@ import 'api_client.dart';
 
 /// One stretch of movement a camera's motion detector saw. [endedAt] is null
 /// while the motion is still going on; [hasClip] turns true once the camera
-/// has uploaded its recording of it, shortly after it ends.
+/// has uploaded its recording of it, shortly after it ends. [thumbnailUrl] is
+/// a still of the moment motion started, usually there within seconds; it's
+/// signed and short-lived, like a clip's URL.
 class MotionEvent {
   const MotionEvent({
     required this.id,
@@ -14,6 +16,7 @@ class MotionEvent {
     required this.startedAt,
     required this.endedAt,
     required this.hasClip,
+    this.thumbnailUrl,
   });
 
   final String id;
@@ -21,6 +24,7 @@ class MotionEvent {
   final DateTime startedAt;
   final DateTime? endedAt;
   final bool hasClip;
+  final Uri? thumbnailUrl;
 
   bool get ongoing => endedAt == null;
 
@@ -30,12 +34,13 @@ class MotionEvent {
         startedAt: dateTimeFromEpochSeconds(json['started_at'] as num),
         endedAt: json['ended_at'] == null ? null : dateTimeFromEpochSeconds(json['ended_at'] as num),
         hasClip: json['has_clip'] as bool? ?? false,
+        thumbnailUrl: json['thumbnail_url'] == null ? null : Uri.parse(json['thumbnail_url'] as String),
       );
 }
 
 /// A camera's motion history and clips. Viewer Mode (a user-signed
 /// [ApiClient]) loads the timeline and streams clips; Camera Mode (a
-/// device-signed one) uploads each event's clip. New events arrive live over
+/// device-signed one) uploads each event's thumbnail and clip. New events arrive live over
 /// the signaling socket as `motion`; this only loads the backlog.
 class MotionApi {
   MotionApi(this._client);
@@ -50,17 +55,22 @@ class MotionApi {
   /// Uploads [file] as [eventId]'s clip: the server hands out a signed URL,
   /// the file goes straight to clip storage, then the server is told it's
   /// there. Throws [ApiException] on a refusal from either.
-  Future<void> uploadClip(String eventId, File file) async {
-    final grant = await _client.send('POST', '/motion-events/$eventId/clip/upload') as Map<String, dynamic>;
-    final status = await _put(Uri.parse(grant['url'] as String), file).timeout(_uploadTimeout);
-    if (status != 200) throw ApiException(status, 'PUT clip upload');
-    await _client.send('POST', '/motion-events/$eventId/clip/done', expectStatus: 204);
+  Future<void> uploadClip(String eventId, File file) => _upload(eventId, 'clip', file, 'video/mp4');
+
+  /// Uploads [file] (a JPEG) as [eventId]'s thumbnail, the same way.
+  Future<void> uploadThumbnail(String eventId, File file) => _upload(eventId, 'thumbnail', file, 'image/jpeg');
+
+  Future<void> _upload(String eventId, String kind, File file, String contentType) async {
+    final grant = await _client.send('POST', '/motion-events/$eventId/$kind/upload') as Map<String, dynamic>;
+    final status = await _put(Uri.parse(grant['url'] as String), file, contentType).timeout(_uploadTimeout);
+    if (status != 200) throw ApiException(status, 'PUT $kind upload');
+    await _client.send('POST', '/motion-events/$eventId/$kind/done', expectStatus: 204);
   }
 
   /// Streams [file] as the request body rather than reading it into memory.
-  static Future<int> _put(Uri url, File file) async {
+  static Future<int> _put(Uri url, File file, String contentType) async {
     final request = http.StreamedRequest('PUT', url)
-      ..headers['Content-Type'] = 'video/mp4'
+      ..headers['Content-Type'] = contentType
       ..contentLength = await file.length();
     final sent = request.send();
     await request.sink.addStream(file.openRead());
