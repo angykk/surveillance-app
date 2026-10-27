@@ -1,3 +1,4 @@
+import '../motion/motion_label.dart';
 import 'api_client.dart';
 
 class Household {
@@ -69,6 +70,9 @@ class HouseholdsApi {
 
   Future<void> renameCamera(String deviceId, String name) =>
       _client.send('PATCH', '/devices/$deviceId', json: {'name': name});
+
+  Future<void> setDetectionMode(String deviceId, DetectionMode mode) =>
+      _client.send('PATCH', '/devices/$deviceId/settings', json: {'detection_mode': mode.name});
 
   Future<void> removeCamera(String deviceId) =>
       _client.send('DELETE', '/devices/$deviceId', expectStatus: 204);

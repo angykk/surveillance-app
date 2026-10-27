@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../api/motion_api.dart';
+import '../motion/motion_label.dart';
 import 'shared_widgets.dart';
 
 /// How long after an event ends its clip is still expected to arrive; past
@@ -156,9 +157,15 @@ class _EventTile extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      DateFormat.jm().format(event.startedAt),
-                      style: textTheme.bodyLarge?.copyWith(color: selected ? colors.onSecondaryContainer : null),
+                    Row(
+                      children: [
+                        Text(
+                          DateFormat.jm().format(event.startedAt),
+                          style: textTheme.bodyLarge?.copyWith(color: selected ? colors.onSecondaryContainer : null),
+                        ),
+                        const SizedBox(width: 8),
+                        _LabelTag(label: event.label),
+                      ],
                     ),
                     if (clipNote != null)
                       Text(clipNote, style: textTheme.bodySmall?.copyWith(color: colors.onSurfaceVariant)),
@@ -173,6 +180,32 @@ class _EventTile extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// What the camera saw in an event: a person, a pet, or just motion.
+class _LabelTag extends StatelessWidget {
+  const _LabelTag({required this.label});
+
+  final MotionLabel label;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final (icon, text) = switch (label) {
+      MotionLabel.person => (Icons.person, 'Person'),
+      MotionLabel.pet => (Icons.pets, 'Pet'),
+      MotionLabel.motion => (Icons.motion_photos_on_outlined, 'Motion'),
+    };
+    final color = label == MotionLabel.person ? theme.colorScheme.primary : theme.colorScheme.onSurfaceVariant;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 14, color: color),
+        const SizedBox(width: 2),
+        Text(text, style: theme.textTheme.labelSmall?.copyWith(color: color)),
+      ],
     );
   }
 }

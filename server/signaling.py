@@ -40,7 +40,12 @@ socketio = SocketIO()
 # Cameras also report motion (`motion-start` / `motion-end`), which is stored
 # as a motion event and pushed live to the household's viewers as `motion`.
 # `motion-start` acks with the event id, which the camera later uploads that
-# event's clip against (see motion.py).
+# event's clip against (see motion.py). It carries the event's label (what
+# the camera's detector saw: a person, a pet, or just motion), and
+# `motion-label` raises it if, say, a person walks in partway through.
+#
+# A camera's settings (for now, its detection mode) are pushed to it as
+# `settings` when it connects and whenever they change from Viewer Mode.
 #
 # This presence state is per-process, so the server must run as a single
 # instance until it moves to Redis.
@@ -70,7 +75,7 @@ def _roster(household_ids):
         return []
     rows = (
         db.table('devices')
-        .select('id, name, household_id, last_seen_at, households(name)')
+        .select('id, name, detection_mode, household_id, last_seen_at, households(name)')
         .in_('household_id', list(household_ids))
         .is_('revoked_at', 'null')
         .order('created_at')
@@ -81,6 +86,7 @@ def _roster(household_ids):
         {
             'id': row['id'],
             'name': row['name'],
+            'detection_mode': row['detection_mode'],
             'household_id': row['household_id'],
             'household_name': row['households']['name'],
             'online': row['id'] in cameras,
@@ -126,6 +132,18 @@ def device_renamed(device_id, household_id, name):
         # shows (and saves) its own name.
         socketio.emit('renamed', {'name': name}, to=camera['sid'])
     broadcast_roster(household_id)
+
+
+def _settings(device):
+    return {'detection_mode': device['detection_mode']}
+
+
+@_locked
+def device_settings_changed(device):
+    camera = cameras.get(device['id'])
+    if camera is not None:
+        socketio.emit('settings', _settings(device), to=camera['sid'])
+    broadcast_roster(device['household_id'])
 
 
 @_locked
@@ -180,6 +198,7 @@ def on_connect(auth_payload):
         }
         _set_last_seen(device['id'])
         print(f"Camera '{device['name']}' ({device['id']}) connected: {request.sid}")
+        socketio.emit('settings', _settings(device), to=request.sid)
         broadcast_roster(device['household_id'])
         return
 
@@ -308,6 +327,7 @@ def serialize_motion_event(row, thumbnail_url=None):
         'started_at': row['started_at'],
         'ended_at': row['ended_at'],
         'has_clip': row.get('clip_size_bytes') is not None,
+        'label': row.get('label') or 'motion',
         # Signed, and short-lived like a clip's playback URL.
         'thumbnail_url': thumbnail_url,
     }
@@ -344,9 +364,18 @@ def close_orphaned_motion_events():
         print(f'Closed {len(closed)} motion events left open by the last shutdown')
 
 
+# Motion event labels, least to most important. A label only ever goes up.
+LABELS = ('motion', 'pet', 'person')
+
+
+def _label_from(data):
+    label = data.get('label') if isinstance(data, dict) else None
+    return label if label in LABELS else 'motion'
+
+
 @socketio.on('motion-start')
 @_locked
-def on_motion_start():
+def on_motion_start(data=None):
     device_id = _camera_id_of_sid(request.sid)
     if device_id is None:
         return
@@ -360,11 +389,34 @@ def on_motion_start():
         'household_id': camera['household_id'],
         'started_at': db.now(),
         'ended_at': None,
+        'label': _label_from(data),
     }).execute())
     camera['motion_event_id'] = row['id']
-    print(f"Motion started on camera '{camera['name']}' ({device_id})")
+    print(f"Motion ({row['label']}) started on camera '{camera['name']}' ({device_id})")
     broadcast_motion(row)
     return {'id': row['id']}
+
+
+@socketio.on('motion-label')
+@_locked
+def on_motion_label(data=None):
+    """Raises the label of the camera's open motion event, e.g. to 'person'
+    once its detector sees someone in motion that started without them."""
+    device_id = _camera_id_of_sid(request.sid)
+    if device_id is None:
+        return
+    event_id = cameras[device_id]['motion_event_id']
+    label = _label_from(data)
+    if event_id is None:
+        return
+    lower = list(LABELS[:LABELS.index(label)])
+    if not lower:
+        return
+    row = db.first(
+        db.table('motion_events').update({'label': label}).eq('id', event_id).in_('label', lower).execute()
+    )
+    if row is not None:
+        broadcast_motion(row)
 
 
 @socketio.on('motion-end')

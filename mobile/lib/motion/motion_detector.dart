@@ -2,43 +2,65 @@ import 'dart:async';
 import 'dart:isolate';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 
-/// Background-subtraction motion detector.
+import 'motion_label.dart';
+import 'person_detector.dart';
+
+/// What one frame showed: whether anything moved and, if it did, the most
+/// important thing in the picture ([MotionLabel.motion] for nobody).
+typedef FrameCheck = ({bool motion, MotionLabel label});
+
+const _noMotion = (motion: false, label: MotionLabel.motion);
+
+/// Two-stage motion detector.
 ///
 /// Feed it successive camera frames (JPEG/PNG-encoded bytes, as returned by
 /// `MediaStreamTrack.captureFrame()`) via [detect]. It maintains a running
 /// MOG2 background model and reports whether the latest frame contains a
 /// foreground blob large enough to count as motion, filtering out sensor
-/// noise and minor lighting changes.
+/// noise and minor lighting changes. Only when something moved does it run
+/// the much heavier [PersonDetector] on the frame, to say whether that was a
+/// person (or a pet), so a still scene costs no more than before.
 ///
 /// The work runs on its own isolate: decoding and processing a frame every
 /// second on the UI isolate made the camera screen stutter, and froze it once
 /// a warm, throttled phone took longer than a second per frame.
 class MotionDetector {
-  /// [worker] stands in for the OpenCV worker in tests.
-  MotionDetector({@visibleForTesting void Function(SendPort responses) worker = _workerMain}) {
-    _ready = _start(worker);
+  /// [worker] stands in for the OpenCV worker in tests, and [loadModel]
+  /// for reading the person detector's model from the asset bundle.
+  MotionDetector({
+    @visibleForTesting void Function(WorkerStart start) worker = _workerMain,
+    @visibleForTesting Future<Uint8List?> Function() loadModel = _loadBundledModel,
+  }) {
+    _ready = _start(worker, loadModel);
   }
 
   late final Future<void> _ready;
   Isolate? _isolate;
-  final _handshake = Completer<SendPort?>();
+  final _handshake = Completer<(SendPort, bool)?>();
   SendPort? _requests;
+  bool _canSeePeople = false;
   final _responses = ReceivePort();
-  final _pending = <int, Completer<bool>>{};
+  final _pending = <int, Completer<FrameCheck>>{};
   int _nextId = 0;
   bool _disposed = false;
 
-  Future<void> _start(void Function(SendPort) worker) async {
+  Future<void> _start(void Function(WorkerStart) worker, Future<Uint8List?> Function() loadModel) async {
     _responses.listen((message) {
-      if (message is SendPort) {
+      if (message is (SendPort, bool)) {
         if (!_handshake.isCompleted) _handshake.complete(message);
-      } else if (message is (int, bool)) {
-        _pending.remove(message.$1)?.complete(message.$2);
+      } else if (message is (int, bool, int)) {
+        _pending.remove(message.$1)?.complete((motion: message.$2, label: MotionLabel.values[message.$3]));
       }
     });
-    final isolate = await Isolate.spawn(worker, _responses.sendPort, debugName: 'motion-detector');
+    final model = await loadModel();
+    final isolate = await Isolate.spawn(
+      worker,
+      (_responses.sendPort, model == null ? null : TransferableTypedData.fromList([model])),
+      debugName: 'motion-detector',
+    );
     _isolate = isolate;
     // Disposed while the isolate was starting: [dispose] had nothing to
     // kill yet, so the isolate would have run on, unused, for good.
@@ -46,7 +68,10 @@ class MotionDetector {
       isolate.kill(priority: Isolate.immediate);
       return;
     }
-    _requests = await _handshake.future;
+    final handshake = await _handshake.future;
+    if (handshake == null) return;
+    _requests = handshake.$1;
+    _canSeePeople = handshake.$2;
   }
 
   @visibleForTesting
@@ -55,12 +80,21 @@ class MotionDetector {
   @visibleForTesting
   Isolate? get isolate => _isolate;
 
-  /// Whether [encodedFrame] shows motion against the frames before it.
-  Future<bool> detect(Uint8List encodedFrame) async {
+  /// Whether the person detector loaded. Without it every [FrameCheck] says
+  /// [MotionLabel.motion], so a camera set to people only would never open
+  /// an event; it has to fall back to any motion instead.
+  Future<bool> get canSeePeople async {
     await _ready;
-    if (_disposed) return false;
+    return _canSeePeople;
+  }
+
+  /// Whether [encodedFrame] shows motion against the frames before it, and
+  /// who or what is in it if so.
+  Future<FrameCheck> detect(Uint8List encodedFrame) async {
+    await _ready;
+    if (_disposed) return _noMotion;
     final id = _nextId++;
-    final result = Completer<bool>();
+    final result = Completer<FrameCheck>();
     _pending[id] = result;
     _requests!.send((id, TransferableTypedData.fromList([encodedFrame])));
     return result.future;
@@ -85,7 +119,7 @@ class MotionDetector {
     // waiting on it forever.
     if (!_handshake.isCompleted) _handshake.complete(null);
     for (final pending in _pending.values) {
-      pending.complete(false);
+      pending.complete(_noMotion);
     }
     _pending.clear();
   }
@@ -93,9 +127,34 @@ class MotionDetector {
 
 const _resetRequest = 'reset';
 
-void _workerMain(SendPort responses) {
+/// What the worker isolate starts with: where to send its answers, and the
+/// person detector's model (null if it couldn't be read).
+typedef WorkerStart = (SendPort responses, TransferableTypedData? model);
+
+const _modelAsset = 'assets/models/yolox_nano.onnx';
+
+Future<Uint8List?> _loadBundledModel() async {
+  try {
+    final data = await rootBundle.load(_modelAsset);
+    return data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+  } catch (e) {
+    debugPrint('Loading the person detector failed: $e');
+    return null;
+  }
+}
+
+void _workerMain(WorkerStart start) {
+  final (responses, model) = start;
+  PersonDetector? people;
+  if (model != null) {
+    try {
+      people = PersonDetector(model.materialize().asUint8List());
+    } catch (e) {
+      debugPrint('Loading the person detector failed: $e');
+    }
+  }
   final requests = ReceivePort();
-  responses.send(requests.sendPort);
+  responses.send((requests.sendPort, people != null));
   var detector = _Mog2Detector();
   requests.listen((message) {
     if (message == _resetRequest) {
@@ -105,13 +164,28 @@ void _workerMain(SendPort responses) {
     }
     final (id, data) = message as (int, TransferableTypedData);
     var motion = false;
+    var label = MotionLabel.motion;
     try {
-      motion = detector.detect(data.materialize().asUint8List());
+      final encodedFrame = data.materialize().asUint8List();
+      motion = detector.detect(encodedFrame);
+      if (motion && people != null) label = _whoIsIn(people, encodedFrame);
     } catch (_) {
       // Best-effort: an undecodable frame just counts as no motion.
     }
-    responses.send((id, motion));
+    responses.send((id, motion, label.index));
   });
+}
+
+MotionLabel _whoIsIn(PersonDetector people, Uint8List encodedFrame) {
+  final watch = Stopwatch()..start();
+  // Half size (640x360 from 720p) is still more than the model's input.
+  final frame = cv.imdecode(encodedFrame, cv.IMREAD_REDUCED_COLOR_2);
+  try {
+    return people.detect(frame);
+  } finally {
+    frame.dispose();
+    if (kDebugMode) debugPrint('Person detection took ${watch.elapsedMilliseconds} ms');
+  }
 }
 
 class _Mog2Detector {

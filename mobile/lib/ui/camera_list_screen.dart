@@ -5,6 +5,7 @@ import '../api/households_api.dart';
 import '../auth/session.dart';
 import '../api/motion_api.dart';
 import '../config.dart';
+import '../motion/motion_label.dart';
 import '../signaling/signaling_client.dart';
 import 'app_theme.dart';
 import 'pairing_code_screen.dart';
@@ -21,6 +22,7 @@ class CameraInfo {
     required this.householdName,
     required this.online,
     required this.lastSeenAt,
+    this.detectionMode = DetectionMode.person,
   });
 
   final String id;
@@ -32,6 +34,9 @@ class CameraInfo {
   /// When the camera last connected or disconnected; null if it never has.
   final DateTime? lastSeenAt;
 
+  /// What the camera opens motion events for.
+  final DetectionMode detectionMode;
+
   factory CameraInfo.fromJson(Map<dynamic, dynamic> json) => CameraInfo(
         id: json['id'] as String,
         name: json['name'] as String,
@@ -39,6 +44,7 @@ class CameraInfo {
         householdName: json['household_name'] as String,
         online: json['online'] as bool,
         lastSeenAt: json['last_seen_at'] == null ? null : dateTimeFromEpochSeconds(json['last_seen_at'] as num),
+        detectionMode: DetectionMode.fromName(json['detection_mode']),
       );
 }
 
@@ -188,6 +194,12 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
     await _runAction(() => _householdsApi.renameCamera(camera.id, newName), 'Rename failed');
   }
 
+  Future<void> _setDetectionMode(CameraInfo camera, DetectionMode mode) async {
+    if (mode == camera.detectionMode) return;
+    // The server pushes the new mode to the camera and to every roster.
+    await _runAction(() => _householdsApi.setDetectionMode(camera.id, mode), 'Changing detection failed');
+  }
+
   Future<void> _removeCamera(CameraInfo camera) async {
     final confirmed = await showConfirmDialog(
       context,
@@ -333,11 +345,26 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
         title: Text(camera.name, style: const TextStyle(fontWeight: FontWeight.bold)),
         subtitle: Text(status),
         trailing: _canManage(camera)
-            ? PopupMenuButton<String>(
-                onSelected: (action) => action == 'rename' ? _renameCamera(camera) : _removeCamera(camera),
-                itemBuilder: (context) => const [
-                  PopupMenuItem(value: 'rename', child: Text('Rename')),
-                  PopupMenuItem(value: 'remove', child: Text('Remove camera')),
+            ? PopupMenuButton<Object>(
+                onSelected: (action) => switch (action) {
+                  DetectionMode mode => _setDetectionMode(camera, mode),
+                  'rename' => _renameCamera(camera),
+                  _ => _removeCamera(camera),
+                },
+                itemBuilder: (context) => [
+                  CheckedPopupMenuItem(
+                    value: DetectionMode.person,
+                    checked: camera.detectionMode == DetectionMode.person,
+                    child: const Text('Record people only'),
+                  ),
+                  CheckedPopupMenuItem(
+                    value: DetectionMode.any,
+                    checked: camera.detectionMode == DetectionMode.any,
+                    child: const Text('Record any motion'),
+                  ),
+                  const PopupMenuDivider(),
+                  const PopupMenuItem(value: 'rename', child: Text('Rename')),
+                  const PopupMenuItem(value: 'remove', child: Text('Remove camera')),
                 ],
               )
             : const Icon(Icons.chevron_right),

@@ -18,7 +18,7 @@ HISTORY_DEFAULT_LIMIT = 100
 HISTORY_MAX_LIMIT = 500
 
 _EVENT_COLUMNS = (
-    'id, device_id, household_id, started_at, ended_at, clip_key, clip_size_bytes, thumb_key, thumb_size_bytes'
+    'id, device_id, household_id, started_at, ended_at, clip_key, clip_size_bytes, thumb_key, thumb_size_bytes, label'
 )
 
 # What a camera can attach to one of its events: the key and size columns

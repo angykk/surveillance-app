@@ -38,7 +38,8 @@ create table if not exists devices (
   token_hash text not null unique,
   created_at real not null,
   last_seen_at real,
-  revoked_at real
+  revoked_at real,
+  detection_mode text not null default 'person'
 );
 create table if not exists pairing_codes (
   code text primary key,
@@ -56,7 +57,8 @@ create table if not exists motion_events (
   clip_key text,
   clip_size_bytes integer,
   thumb_key text,
-  thumb_size_bytes integer
+  thumb_size_bytes integer,
+  label text not null default 'motion'
 );
 create table if not exists clip_deletions (
   clip_key text primary key,
@@ -73,6 +75,16 @@ begin
   select old.thumb_key, (julianday('now') - 2440587.5) * 86400.0 where old.thumb_key is not null;
 end;
 '''
+
+# Columns added after the first local databases were made: table -> (column, type).
+_ADDED_COLUMNS = {
+    'devices': (('detection_mode', "text not null default 'person'"),),
+    'motion_events': (
+        ('thumb_key', 'text'),
+        ('thumb_size_bytes', 'integer'),
+        ('label', "text not null default 'motion'"),
+    ),
+}
 
 # (table, embedded table) -> the foreign key column on `table`.
 _FOREIGN_KEYS = {
@@ -92,13 +104,14 @@ class SQLiteClient:
         self._conn.executescript(SCHEMA)
 
     def _add_missing_columns(self):
-        """Brings a database made before thumbnails up to date; `create table
-        if not exists` leaves an existing table as it was."""
-        columns = {row['name'] for row in self._conn.execute('pragma table_info(motion_events)')}
-        if columns:
-            for column, kind in (('thumb_key', 'text'), ('thumb_size_bytes', 'integer')):
-                if column not in columns:
-                    self._conn.execute(f'alter table motion_events add column {column} {kind}')
+        """Brings a database made before thumbnails or detection labels up to
+        date; `create table if not exists` leaves an existing table as it was."""
+        for table, added in _ADDED_COLUMNS.items():
+            columns = {row['name'] for row in self._conn.execute(f'pragma table_info({table})')}
+            if columns:
+                for column, kind in added:
+                    if column not in columns:
+                        self._conn.execute(f'alter table {table} add column {column} {kind}')
 
     def table(self, name):
         return _Query(self, name)

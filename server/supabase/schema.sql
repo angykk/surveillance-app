@@ -42,8 +42,15 @@ create table if not exists public.devices (
   token_hash text not null unique,
   created_at double precision not null,
   last_seen_at double precision,
-  revoked_at double precision
+  revoked_at double precision,
+  -- Which motion opens an event: 'person' (only once the camera's person
+  -- detector sees someone) or 'any'. Set from Viewer Mode, pushed to the
+  -- camera as `settings`.
+  detection_mode text not null default 'person' check (detection_mode in ('person', 'any'))
 );
+-- For a table created before detection modes were added.
+alter table public.devices add column if not exists detection_mode text not null default 'person'
+  check (detection_mode in ('person', 'any'));
 create index if not exists devices_household_id_idx on public.devices (household_id);
 
 create table if not exists public.pairing_codes (
@@ -64,7 +71,8 @@ create index if not exists pairing_codes_created_by_idx on public.pairing_codes 
 -- clip_size_bytes once the upload is confirmed, which is what makes the
 -- event playable; both stay null if no upload ever arrives. thumb_key and
 -- thumb_size_bytes work the same way for the event's thumbnail, a still of
--- the moment motion started that the camera uploads right away.
+-- the moment motion started that the camera uploads right away. label is
+-- what the camera's detector saw: 'person', 'pet', or just 'motion'.
 create table if not exists public.motion_events (
   id uuid primary key,
   device_id uuid not null references public.devices (id) on delete cascade,
@@ -74,11 +82,14 @@ create table if not exists public.motion_events (
   clip_key text,
   clip_size_bytes bigint,
   thumb_key text,
-  thumb_size_bytes bigint
+  thumb_size_bytes bigint,
+  label text not null default 'motion' check (label in ('motion', 'person', 'pet'))
 );
--- For a table created before thumbnails were added.
+-- For a table created before thumbnails or labels were added.
 alter table public.motion_events add column if not exists thumb_key text;
 alter table public.motion_events add column if not exists thumb_size_bytes bigint;
+alter table public.motion_events add column if not exists label text not null default 'motion'
+  check (label in ('motion', 'person', 'pet'));
 create index if not exists motion_events_device_id_started_at_idx on public.motion_events (device_id, started_at desc);
 create index if not exists motion_events_household_id_idx on public.motion_events (household_id);
 

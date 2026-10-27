@@ -165,6 +165,24 @@ def rename_device(device_id):
     return jsonify({'id': device_id, 'name': name})
 
 
+DETECTION_MODES = ('person', 'any')
+
+
+@bp.route('/devices/<device_id>/settings', methods=['PATCH'])
+@auth.require_user
+def update_device_settings(device_id):
+    """A camera's settings, changed from Viewer Mode. For now that's only its
+    detection mode: open motion events for people only, or for any motion."""
+    device = _managed_device_or_404(device_id)
+    mode = (request.get_json(silent=True) or {}).get('detection_mode')
+    if mode not in DETECTION_MODES:
+        abort(400)
+    db.table('devices').update({'detection_mode': mode}).eq('id', device_id).execute()
+    device['detection_mode'] = mode
+    signaling.device_settings_changed(device)
+    return jsonify({'id': device_id, 'detection_mode': mode})
+
+
 @bp.route('/devices/<device_id>', methods=['DELETE'])
 @auth.require_user
 def revoke_device(device_id):

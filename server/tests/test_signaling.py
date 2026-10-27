@@ -252,3 +252,72 @@ def test_rename_only_reaches_the_renamed_camera(app, client):
 
     client.patch(f"/devices/{front['device_id']}", json={'name': 'Back Door'}, headers=as_user('alice'))
     assert 'renamed' not in _names(garage_camera)
+
+
+def test_camera_gets_its_settings_on_connect_and_on_change(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    assert _last(camera, 'settings') == {'detection_mode': 'person'}
+
+    response = client.patch(
+        f"/devices/{cam['device_id']}/settings", json={'detection_mode': 'any'}, headers=as_user('alice')
+    )
+    assert response.status_code == 200
+    assert _last(camera, 'settings') == {'detection_mode': 'any'}
+    # It sticks: a reconnect gets the new mode.
+    camera.disconnect()
+    assert _last(_connect_camera(app, cam['device_token']), 'settings') == {'detection_mode': 'any'}
+
+
+def test_detection_mode_shows_in_the_roster(app, client):
+    cam = pair_camera(client, 'alice')
+    alice = _connect_viewer(app, 'alice')
+    alice.get_received()
+    client.patch(f"/devices/{cam['device_id']}/settings", json={'detection_mode': 'any'}, headers=as_user('alice'))
+    [camera] = _last(alice, 'cameras-list')
+    assert camera['detection_mode'] == 'any'
+
+
+def test_only_household_managers_change_settings(app, client):
+    cam = pair_camera(client, 'alice')
+    url = f"/devices/{cam['device_id']}/settings"
+    assert client.patch(url, json={'detection_mode': 'any'}, headers=as_user('bob')).status_code == 404
+    assert client.patch(url, json={'detection_mode': 'sometimes'}, headers=as_user('alice')).status_code == 400
+    assert client.patch('/devices/not-a-uuid/settings', json={'detection_mode': 'any'}, headers=as_user('alice')).status_code == 404
+
+
+def test_motion_start_carries_a_label_that_only_goes_up(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    alice = _connect_viewer(app, 'alice')
+    alice.get_received()
+
+    camera.emit('motion-start', {'label': 'pet'})
+    assert _last(alice, 'motion')['label'] == 'pet'
+    camera.emit('motion-label', {'label': 'person'})
+    assert _last(alice, 'motion')['label'] == 'person'
+    # Never back down, and an unknown label is ignored.
+    camera.emit('motion-label', {'label': 'pet'})
+    camera.emit('motion-label', {'label': 'alien'})
+    assert _last(alice, 'motion') is None
+
+    [event] = client.get(f"/devices/{cam['device_id']}/motion-events", headers=as_user('alice')).get_json()
+    assert event['label'] == 'person'
+
+
+def test_motion_without_a_label_is_plain_motion(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    camera.emit('motion-start', {'label': 'alien'})
+    [event] = client.get(f"/devices/{cam['device_id']}/motion-events", headers=as_user('alice')).get_json()
+    assert event['label'] == 'motion'
+
+
+def test_viewers_cannot_relabel_motion(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    alice = _connect_viewer(app, 'alice')
+    camera.emit('motion-start')
+    alice.get_received()
+    alice.emit('motion-label', {'label': 'person'})
+    assert _last(alice, 'motion') is None

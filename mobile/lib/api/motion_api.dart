@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:http/http.dart' as http;
 
+import '../motion/motion_label.dart';
 import 'api_client.dart';
 
 /// One stretch of movement a camera's motion detector saw. [endedAt] is null
@@ -16,6 +17,7 @@ class MotionEvent {
     required this.startedAt,
     required this.endedAt,
     required this.hasClip,
+    this.label = MotionLabel.motion,
     this.thumbnailUrl,
   });
 
@@ -24,6 +26,9 @@ class MotionEvent {
   final DateTime startedAt;
   final DateTime? endedAt;
   final bool hasClip;
+
+  /// What the camera saw: a person, a pet, or just motion.
+  final MotionLabel label;
   final Uri? thumbnailUrl;
 
   bool get ongoing => endedAt == null;
@@ -34,6 +39,7 @@ class MotionEvent {
         startedAt: dateTimeFromEpochSeconds(json['started_at'] as num),
         endedAt: json['ended_at'] == null ? null : dateTimeFromEpochSeconds(json['ended_at'] as num),
         hasClip: json['has_clip'] as bool? ?? false,
+        label: MotionLabel.fromName(json['label']),
         thumbnailUrl: json['thumbnail_url'] == null ? null : Uri.parse(json['thumbnail_url'] as String),
       );
 }

@@ -13,6 +13,8 @@ import '../api/api_client.dart';
 import '../api/motion_api.dart';
 import '../config.dart';
 import '../motion/motion_detector.dart';
+import '../motion/motion_event_gate.dart';
+import '../motion/motion_label.dart';
 import '../ui/app_theme.dart';
 import '../ui/rename_dialog.dart';
 import '../ui/shared_widgets.dart';
@@ -46,10 +48,6 @@ enum _Status { initializing, ready, permissionDenied, error }
 /// How often a frame is grabbed from the local track and checked for motion.
 const _motionCheckInterval = Duration(seconds: 1);
 
-/// Once motion stops, wait this long before reporting it ended — covers
-/// brief gaps so one stretch of movement isn't split into several events.
-const _motionCooldown = Duration(seconds: 8);
-
 /// A frame capture that hasn't come back by now means the camera has stopped
 /// delivering frames (e.g. iOS paused it under thermal pressure).
 const _captureTimeout = Duration(seconds: 5);
@@ -78,6 +76,11 @@ const _cameraCaptureOptions =
 
 class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver {
   final _motionDetector = MotionDetector();
+
+  /// Once motion stops, waits 8 s before reporting it ended — covers brief
+  /// gaps so one stretch of movement isn't split into several events. Its
+  /// detection mode comes from the server's `settings`.
+  final _motionGate = MotionEventGate(cooldown: const Duration(seconds: 8));
   late final _clipQueue = ClipUploadQueue(MotionApi(ApiClient.forDevice(AppConfig.serverUrl, widget.credentials.token)));
   Timer? _clipRetryTimer;
   late final SignalingClient _signaling;
@@ -107,7 +110,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   bool _motionCheckInFlight = false;
   int _stalledCaptures = 0;
   bool _restartingCamera = false;
-  DateTime? _lastMotionAt;
+
+  /// The detection mode Viewer Mode chose for this camera, until the
+  /// server's `settings` arrive on connect.
+  DetectionMode _detectionMode = DetectionMode.person;
 
   _Status _status = _Status.initializing;
   /// Shown over the preview only while the server can't be reached; when
@@ -132,6 +138,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     // minute or so, which pauses the app and stops the camera.
     WakelockPlus.enable();
     _connectSignaling();
+    _applyDetectionMode(_detectionMode);
     _setup();
     // Clips left over from an earlier run (e.g. the app was killed while
     // offline) go up as soon as possible.
@@ -181,6 +188,19 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       final name = data is Map ? data['name'] : null;
       if (name is String) _applyName(name);
     });
+    // Sent on every connect, and when Viewer Mode changes them.
+    _signaling.socket.on('settings', (data) {
+      if (data is Map) _applyDetectionMode(DetectionMode.fromName(data['detection_mode']));
+    });
+  }
+
+  /// People-only needs the person detector; if its model didn't load, any
+  /// motion has to do rather than never opening an event at all.
+  Future<void> _applyDetectionMode(DetectionMode mode) async {
+    _detectionMode = mode;
+    final canSeePeople = await _motionDetector.canSeePeople;
+    if (_detectionMode != mode) return;
+    _motionGate.mode = canSeePeople ? mode : DetectionMode.any;
   }
 
   Future<void> _showRenameDialog() async {
@@ -336,17 +356,18 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       }
       _stalledCaptures = 0;
       final frameBytes = frame.asUint8List();
-      final motionDetected = await _motionDetector.detect(frameBytes);
+      final check = await _motionDetector.detect(frameBytes);
       if (_videoTrack != track) return;
 
-      if (motionDetected) {
-        _lastMotionAt = DateTime.now();
-        if (!_motionActive) await _startMotion(frameBytes);
-      } else if (_motionActive) {
-        final last = _lastMotionAt;
-        if (last != null && DateTime.now().difference(last) >= _motionCooldown) {
+      switch (_motionGate.next(check, eventOpen: _motionActive)) {
+        case StartEvent(:final label):
+          await _startMotion(frameBytes, label);
+        case RaiseLabel(:final label):
+          _signaling.socket.emit('motion-label', {'label': label.name});
+        case EndEvent():
           await _endMotion();
-        }
+        case Hold():
+          break;
       }
     } catch (_) {
       // Best-effort: a failed capture/detect just skips this tick.
@@ -369,11 +390,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
   }
 
-  /// Reports motion to the server and records a clip of it, with [frame]
-  /// (the one the motion was seen in) as the event's thumbnail. The event id
-  /// they belong to comes back in `motion-start`'s ack, long before the clip
-  /// is finished.
-  Future<void> _startMotion(Uint8List frame) async {
+  /// Reports motion (of a [label]: a person, say) to the server and records
+  /// a clip of it, with [frame] (the one the event opened on) as the event's
+  /// thumbnail. The event id they belong to comes back in `motion-start`'s
+  /// ack, long before the clip is finished.
+  Future<void> _startMotion(Uint8List frame, MotionLabel label) async {
     final track = _videoTrack;
     if (track == null || _motionActive) return;
     setState(() => _motionActive = true);
@@ -387,7 +408,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
     final clip = _Clip(file);
     _clip = clip;
-    _signaling.socket.emitWithAck('motion-start', null, ack: (data) {
+    _signaling.socket.emitWithAck('motion-start', {'label': label.name}, ack: (data) {
       if (!clip.eventId.isCompleted) clip.eventId.complete(data is Map ? data['id'] as String? : null);
     });
     unawaited(_queueThumbnail(clip, frame));

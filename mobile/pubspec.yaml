@@ -35,13 +35,16 @@ flutter:
   uses-material-design: true
   assets:
     - .env
+    - assets/models/
 
 hooks:
   user_defines:
     dartcv4:
       # imgcodecs: imdecode. imgproc: threshold/dilate/findContours/etc.
-      # video: BackgroundSubtractorMOG2. All used by motion_detector.dart.
+      # video: BackgroundSubtractorMOG2. dnn: the person detector's model.
+      # All used by motion_detector.dart.
       include_modules:
+        - dnn
         - imgcodecs
         - imgproc
         - video
