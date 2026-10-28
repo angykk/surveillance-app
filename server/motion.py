@@ -1,9 +1,12 @@
+import traceback
+
 from flask import Blueprint, abort, g, jsonify, request
 
 import auth
 import clip_storage
 import db
 import households
+import retention
 import signaling
 
 bp = Blueprint('motion', __name__)
@@ -118,3 +121,28 @@ def clip_playback_url(event_id):
     if event['clip_size_bytes'] is None:
         abort(404)
     return jsonify({'url': clip_storage.get().playback_url(event['clip_key'])})
+
+
+@bp.route('/motion-events/<event_id>', methods=['DELETE'])
+@auth.require_user
+def delete_motion_event(event_id):
+    """Deletes an event along with its clip and thumbnail, for the whole
+    household. Owners and admins only, like managing the camera itself."""
+    event = _event_or_404(event_id)
+    auth.require_member(event['household_id'], roles=db.MANAGER_ROLES)
+    if event['ended_at'] is None:
+        # The camera is still recording into it, and would keep reporting
+        # (and uploading) against an id that no longer exists.
+        abort(409)
+
+    # The delete trigger queues the clip and thumbnail for deletion from
+    # storage (see supabase/schema.sql).
+    db.table('motion_events').delete().eq('id', event_id).execute()
+    try:
+        retention.drain_deletions(clip_storage.get())
+    except Exception:
+        # Still queued, so the retention job's next pass deletes them.
+        traceback.print_exc()
+    print(f"Motion event {event_id} deleted by user {g.user_id}")
+    signaling.broadcast_motion_deleted(event)
+    return '', 204

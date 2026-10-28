@@ -3,10 +3,12 @@ import 'package:intl/intl.dart';
 import 'package:livekit_client/livekit_client.dart';
 import 'package:video_player/video_player.dart';
 
+import '../api/api_client.dart';
 import '../api/motion_api.dart';
 import '../signaling/signaling_client.dart';
 import 'app_theme.dart';
 import 'camera_list_screen.dart';
+import 'clip_actions.dart';
 import 'motion_timeline.dart';
 import 'shared_widgets.dart';
 
@@ -24,15 +26,26 @@ const _timelinePanelWidth = 320.0;
 /// at the top as a 16:9 panel with the camera's motion timeline below; in
 /// landscape the video takes the screen with the timeline as a side panel.
 /// Tapping an event with a clip plays it in the video panel in place of the
-/// live feed, until "Back to live". Offline cameras open here too: the
+/// live feed, until "Back to live". A clip can be shared from its row or
+/// while it plays, and owners and admins ([canManage]) can delete it. Offline cameras open here too: the
 /// timeline and clips still work, and the stream starts by itself once the
 /// camera comes back online.
 class ViewerScreen extends StatefulWidget {
-  const ViewerScreen({super.key, required this.signaling, required this.camera, required this.motionApi});
+  const ViewerScreen({
+    super.key,
+    required this.signaling,
+    required this.camera,
+    required this.motionApi,
+    required this.canManage,
+  });
 
   final SignalingClient signaling;
   final CameraInfo camera;
   final MotionApi motionApi;
+
+  /// Whether the user is an owner or admin of the camera's household, so
+  /// can delete its events.
+  final bool canManage;
 
   @override
   State<ViewerScreen> createState() => _ViewerScreenState();
@@ -77,6 +90,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
   late final void Function(dynamic) _onPeerLeft;
   late final void Function(dynamic) _onRoster;
   late final void Function(dynamic) _onMotion;
+  late final void Function(dynamic) _onMotionDeleted;
 
   @override
   void initState() {
@@ -92,12 +106,17 @@ class _ViewerScreenState extends State<ViewerScreen> {
     _onPeerLeft = (_) => _resetToWaiting(_camera.online ? '${_camera.name} disconnected' : _offlineStatus());
     _onRoster = _handleRoster;
     _onMotion = _handleMotion;
+    _onMotionDeleted = (data) {
+      final map = data as Map;
+      if (map['camera_id'] == _camera.id) _removeEvent(map['id'] as String);
+    };
 
     _signaling.socket.on('connect', _onConnect);
     _signaling.socket.on('disconnect', _onDisconnect);
     _signaling.socket.on('peer-left', _onPeerLeft);
     _signaling.socket.on('cameras-list', _onRoster);
     _signaling.socket.on('motion', _onMotion);
+    _signaling.socket.on('motion-deleted', _onMotionDeleted);
 
     if (!_signaling.socket.connected) {
       _signaling.socket.connect();
@@ -254,6 +273,36 @@ class _ViewerScreenState extends State<ViewerScreen> {
     }
   }
 
+  void _shareEvent(MotionEvent event, BuildContext origin) => shareClip(
+        context,
+        motionApi: widget.motionApi,
+        event: event,
+        cameraName: _camera.name,
+        origin: origin,
+      );
+
+  Future<void> _deleteEvent(MotionEvent event) async {
+    if (!await confirmDeleteEvent(context)) return;
+    try {
+      await widget.motionApi.deleteEvent(event.id);
+      // Other viewers hear about it over the socket; this one needn't wait.
+      _removeEvent(event.id);
+    } catch (e) {
+      if (!mounted) return;
+      final message = e is ApiException && e.statusCode == 409
+          ? 'Still recording — try again once the motion ends.'
+          : 'Could not delete event: $e';
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    }
+  }
+
+  /// Drops a deleted event, and its clip if that's what's playing.
+  void _removeEvent(String eventId) {
+    if (!mounted) return;
+    if (_clipEvent?.id == eventId) _backToLive();
+    setState(() => _events = _events.where((e) => e.id != eventId).toList());
+  }
+
   void _backToLive() {
     final player = _clipPlayer;
     _clipPlayer = null;
@@ -301,6 +350,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
     _signaling.socket.off('peer-left', _onPeerLeft);
     _signaling.socket.off('cameras-list', _onRoster);
     _signaling.socket.off('motion', _onMotion);
+    _signaling.socket.off('motion-deleted', _onMotionDeleted);
     if (_signaling.socket.connected) {
       _signaling.socket.emit('stop-watching');
     }
@@ -356,6 +406,8 @@ class _ViewerScreenState extends State<ViewerScreen> {
       onRefresh: _loadEvents,
       selectedId: _clipEvent?.id,
       onSelect: _playClip,
+      onShare: _shareEvent,
+      onDelete: widget.canManage ? _deleteEvent : null,
     );
   }
 
@@ -446,6 +498,22 @@ class _ViewerScreenState extends State<ViewerScreen> {
                   ),
                   const SizedBox(width: 8),
                   if (_clipEvent != null) ...[
+                    Builder(
+                      builder: (buttonContext) => OverlayButton(
+                        icon: Icons.ios_share,
+                        tooltip: 'Share clip',
+                        onPressed: () => _shareEvent(_clipEvent!, buttonContext),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    if (widget.canManage) ...[
+                      OverlayButton(
+                        icon: Icons.delete_outline,
+                        tooltip: 'Delete event',
+                        onPressed: () => _deleteEvent(_clipEvent!),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
                     FilledButton.icon(
                       style: FilledButton.styleFrom(backgroundColor: AppColors.overlay, foregroundColor: AppColors.white),
                       onPressed: _backToLive,

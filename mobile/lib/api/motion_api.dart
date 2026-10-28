@@ -1,6 +1,8 @@
 import 'dart:io';
 
 import 'package:http/http.dart' as http;
+import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../motion/motion_label.dart';
 import 'api_client.dart';
@@ -68,7 +70,7 @@ class MotionApi {
 
   Future<void> _upload(String eventId, String kind, File file, String contentType) async {
     final grant = await _client.send('POST', '/motion-events/$eventId/$kind/upload') as Map<String, dynamic>;
-    final status = await _put(Uri.parse(grant['url'] as String), file, contentType).timeout(_uploadTimeout);
+    final status = await _put(Uri.parse(grant['url'] as String), file, contentType).timeout(_transferTimeout);
     if (status != 200) throw ApiException(status, 'PUT $kind upload');
     await _client.send('POST', '/motion-events/$eventId/$kind/done', expectStatus: 204);
   }
@@ -86,14 +88,44 @@ class MotionApi {
     return response.statusCode;
   }
 
-  /// Covers the PUT of the file itself, which takes much longer than an
-  /// ordinary API call on a slow uplink.
-  static const _uploadTimeout = Duration(minutes: 5);
+  /// Covers the transfer of a file itself (a clip's upload or download),
+  /// which takes much longer than an ordinary API call on a slow link.
+  static const _transferTimeout = Duration(minutes: 5);
 
   /// A short-lived URL the video player streams [eventId]'s clip from. It's
   /// signed for that one clip, so the player sends no auth headers.
   Future<Uri> clipUrl(String eventId) async {
     final data = await _client.send('GET', '/motion-events/$eventId/clip-url') as Map<String, dynamic>;
     return Uri.parse(data['url'] as String);
+  }
+
+  /// Deletes [eventId] with its clip and thumbnail, for the whole household.
+  /// Owners and admins only; an event still being recorded gets a 409.
+  Future<void> deleteEvent(String eventId) =>
+      _client.send('DELETE', '/motion-events/$eventId', expectStatus: 204);
+
+  /// Downloads [event]'s clip to a temporary file named after [cameraName]
+  /// and when it started, for handing to the share sheet. Earlier downloads
+  /// are cleared out first, so they don't pile up.
+  Future<File> downloadClip(MotionEvent event, String cameraName) async {
+    final url = await clipUrl(event.id);
+    final dir = Directory('${(await getTemporaryDirectory()).path}/shared-clips');
+    if (await dir.exists()) await dir.delete(recursive: true);
+    await dir.create(recursive: true);
+    final name = cameraName.replaceAll(RegExp(r'[^\w-]+'), '-');
+    final file = File('${dir.path}/$name-${DateFormat('yyyyMMdd-HHmmss').format(event.startedAt)}.mp4');
+
+    final client = http.Client();
+    try {
+      final response = await client.send(http.Request('GET', url)).timeout(_transferTimeout);
+      if (response.statusCode != 200) {
+        await response.stream.drain<void>();
+        throw ApiException(response.statusCode, 'GET clip download');
+      }
+      await response.stream.pipe(file.openWrite()).timeout(_transferTimeout);
+    } finally {
+      client.close();
+    }
+    return file;
   }
 }

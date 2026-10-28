@@ -26,7 +26,12 @@ def run_once(retention_days, storage):
         expired = db.table('motion_events').delete().lt('started_at', cutoff).execute().data
         if expired:
             print(f'Retention: deleted {len(expired)} motion events older than {retention_days} days')
+    drain_deletions(storage)
 
+
+def drain_deletions(storage):
+    """Deletes every object queued in `clip_deletions` from storage. Also run
+    right after a user deletes an event, so its files go straight away."""
     while True:
         rows = db.table('clip_deletions').select('clip_key').limit(BATCH_SIZE).execute().data
         if not rows:
@@ -34,7 +39,7 @@ def run_once(retention_days, storage):
         keys = [row['clip_key'] for row in rows]
         storage.delete(keys)
         db.table('clip_deletions').delete().in_('clip_key', keys).execute()
-        print(f'Retention: deleted {len(keys)} clips from storage')
+        print(f'Deleted {len(keys)} clips from storage')
         if len(rows) < BATCH_SIZE:
             return
 

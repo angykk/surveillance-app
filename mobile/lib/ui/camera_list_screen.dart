@@ -150,7 +150,12 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
     // there, and the stream starts once they come back.
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => ViewerScreen(signaling: _signaling, camera: camera, motionApi: _motionApi),
+        builder: (_) => ViewerScreen(
+          signaling: _signaling,
+          camera: camera,
+          motionApi: _motionApi,
+          canManage: _canManage(camera),
+        ),
       ),
     );
   }

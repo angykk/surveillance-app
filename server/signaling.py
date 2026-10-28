@@ -340,6 +340,14 @@ def broadcast_motion(row):
         socketio.emit('motion', event, to=viewer_sid)
 
 
+@_locked
+def broadcast_motion_deleted(row):
+    """Tells the household's open timelines to drop a deleted event."""
+    event = {'id': row['id'], 'camera_id': row['device_id']}
+    for viewer_sid in _household_viewer_sids(row['household_id']):
+        socketio.emit('motion-deleted', event, to=viewer_sid)
+
+
 def _end_motion(device_id, camera):
     """Closes the camera's open motion event, if any. Also runs when a camera
     drops off, so an event is never left "ongoing" forever."""

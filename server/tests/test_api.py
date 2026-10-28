@@ -207,6 +207,55 @@ def test_deleting_an_event_cleans_up_its_thumbnail(app, client):
     assert _stored_keys(app) == []
 
 
+def test_owner_deletes_an_event_with_its_clip_and_thumbnail(app, client):
+    cam = pair_camera(client, 'alice')
+    event_id = _motion_event(app, cam['device_token'])
+    kept_id = _motion_event(app, cam['device_token'])
+    assert upload_thumbnail(client, cam['device_token'], event_id).status_code == 204
+    assert upload_clip(client, cam['device_token'], event_id).status_code == 204
+    viewer = signaling.socketio.test_client(app, auth={'token': user_token('alice')})
+    viewer.get_received()
+
+    assert client.delete(f'/motion-events/{event_id}', headers=as_user('alice')).status_code == 204
+
+    # Gone from the history and from storage straight away, not at the next
+    # retention pass, and open timelines are told.
+    events = _motion_events(client, 'alice', cam['device_id']).get_json()
+    assert [e['id'] for e in events] == [kept_id]
+    assert _stored_keys(app) == []
+    assert db.table('clip_deletions').select('clip_key').execute().data == []
+    [pushed] = [m['args'][0] for m in viewer.get_received() if m['name'] == 'motion-deleted']
+    assert pushed == {'id': event_id, 'camera_id': cam['device_id']}
+    assert client.delete(f'/motion-events/{event_id}', headers=as_user('alice')).status_code == 404
+
+
+def test_ongoing_events_cannot_be_deleted(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = signaling.socketio.test_client(app, auth={'device_token': cam['device_token']})
+    event_id = camera.emit('motion-start', callback=True)['id']
+    assert client.delete(f'/motion-events/{event_id}', headers=as_user('alice')).status_code == 409
+    camera.emit('motion-end')
+    assert client.delete(f'/motion-events/{event_id}', headers=as_user('alice')).status_code == 204
+
+
+def test_only_household_managers_can_delete_events(app, client):
+    cam = pair_camera(client, 'alice')
+    event_id = _motion_event(app, cam['device_token'])
+    household_id = home_household(client, 'alice')
+    # Invites don't exist yet, so carol joins as a viewer directly.
+    home_household(client, 'carol')
+    db.table('memberships').insert(
+        {'user_id': 'carol', 'household_id': household_id, 'role': 'viewer', 'created_at': db.now()}
+    ).execute()
+    home_household(client, 'bob')
+
+    assert client.delete(f'/motion-events/{event_id}', headers=as_user('bob')).status_code == 404
+    assert client.delete(f'/motion-events/{event_id}', headers=as_user('carol')).status_code == 403
+    assert client.delete('/motion-events/not-a-uuid', headers=as_user('alice')).status_code == 404
+    assert client.delete(f'/motion-events/{event_id}', headers=as_device(cam['device_token'])).status_code == 401
+    assert len(_motion_events(client, 'alice', cam['device_id']).get_json()) == 1
+
+
 def test_thumbnail_columns_are_added_to_an_older_local_database(tmp_path):
     path = str(tmp_path / 'old.db')
     conn = sqlite3.connect(path)

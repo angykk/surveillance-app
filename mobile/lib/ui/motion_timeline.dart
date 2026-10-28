@@ -10,7 +10,8 @@ import 'shared_widgets.dart';
 const _clipUploadGrace = Duration(minutes: 2);
 
 /// A camera's motion events, newest first and grouped by day: when it last
-/// saw movement and for how long. Events with a clip are tappable to play it.
+/// saw movement and for how long. Events with a clip are tappable to play it;
+/// each row's ⋮ menu (or a long-press) shares its clip or deletes it.
 class MotionTimeline extends StatelessWidget {
   const MotionTimeline({
     super.key,
@@ -20,6 +21,8 @@ class MotionTimeline extends StatelessWidget {
     required this.onRefresh,
     required this.selectedId,
     required this.onSelect,
+    required this.onShare,
+    this.onDelete,
   });
 
   /// Newest first.
@@ -31,6 +34,13 @@ class MotionTimeline extends StatelessWidget {
   /// The event whose clip is playing, highlighted in the list.
   final String? selectedId;
   final void Function(MotionEvent event) onSelect;
+
+  /// Shares an event's clip; [origin] is the row, for the iPad share popover.
+  final void Function(MotionEvent event, BuildContext origin) onShare;
+
+  /// Deletes an event. Null when the user can't (only owners and admins
+  /// can), which leaves Delete out of the menu.
+  final void Function(MotionEvent event)? onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -65,6 +75,8 @@ class MotionTimeline extends StatelessWidget {
               event: event,
               selected: event.id == selectedId,
               onTap: event.hasClip ? () => onSelect(event) : null,
+              onShare: onShare,
+              onDelete: onDelete,
             );
           },
         ),
@@ -123,15 +135,57 @@ class _DayHeader extends StatelessWidget {
   }
 }
 
-class _EventTile extends StatelessWidget {
-  const _EventTile({required this.event, required this.selected, required this.onTap});
+enum _EventAction { share, delete }
+
+class _EventTile extends StatefulWidget {
+  const _EventTile({
+    required this.event,
+    required this.selected,
+    required this.onTap,
+    required this.onShare,
+    required this.onDelete,
+  });
 
   final MotionEvent event;
   final bool selected;
   final VoidCallback? onTap;
+  final void Function(MotionEvent event, BuildContext origin) onShare;
+  final void Function(MotionEvent event)? onDelete;
+
+  @override
+  State<_EventTile> createState() => _EventTileState();
+}
+
+class _EventTileState extends State<_EventTile> {
+  /// Lets a long-press open the same menu as the ⋮ button.
+  final _menuKey = GlobalKey<PopupMenuButtonState<_EventAction>>();
+
+  /// A share needs a clip; a delete needs the right role, and the motion to
+  /// have ended (the camera is still recording into an ongoing event).
+  List<PopupMenuEntry<_EventAction>> _menuItems() => [
+        if (widget.event.hasClip)
+          const PopupMenuItem(
+            value: _EventAction.share,
+            child: ListTile(leading: Icon(Icons.ios_share), title: Text('Share clip')),
+          ),
+        if (widget.onDelete != null)
+          PopupMenuItem(
+            value: _EventAction.delete,
+            enabled: !widget.event.ongoing,
+            child: const ListTile(leading: Icon(Icons.delete_outline), title: Text('Delete')),
+          ),
+      ];
+
+  void _onAction(_EventAction action) => switch (action) {
+        _EventAction.share => widget.onShare(widget.event, context),
+        _EventAction.delete => widget.onDelete?.call(widget.event),
+      };
 
   @override
   Widget build(BuildContext context) {
+    final event = widget.event;
+    final selected = widget.selected;
+    final hasMenu = _menuItems().isNotEmpty;
     final colors = Theme.of(context).colorScheme;
     final endedAt = event.endedAt;
     final String? clipNote;
@@ -146,9 +200,10 @@ class _EventTile extends StatelessWidget {
     return Material(
       color: selected ? colors.secondaryContainer : Colors.transparent,
       child: InkWell(
-        onTap: onTap,
+        onTap: widget.onTap,
+        onLongPress: hasMenu ? () => _menuKey.currentState?.showButtonMenu() : null,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+          padding: EdgeInsets.fromLTRB(16, 6, hasMenu ? 0 : 16, 6),
           child: Row(
             children: [
               _Thumbnail(event: event),
@@ -176,6 +231,14 @@ class _EventTile extends StatelessWidget {
                 endedAt == null ? 'Ongoing' : _formatDuration(endedAt.difference(event.startedAt)),
                 style: TextStyle(color: event.ongoing ? colors.error : colors.onSurfaceVariant),
               ),
+              if (hasMenu)
+                PopupMenuButton<_EventAction>(
+                  key: _menuKey,
+                  tooltip: 'Event actions',
+                  icon: Icon(Icons.more_vert, color: colors.onSurfaceVariant),
+                  itemBuilder: (_) => _menuItems(),
+                  onSelected: _onAction,
+                ),
             ],
           ),
         ),
