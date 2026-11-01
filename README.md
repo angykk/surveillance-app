@@ -82,6 +82,8 @@ It listens on `0.0.0.0:5050`.
 
 Motion events and their clips are deleted after `RETENTION_DAYS` (default 30; `0` keeps them). The server checks hourly. Clips whose event is deleted any other way, such as a household or Supabase Auth user being deleted, are removed from storage on the same pass.
 
+Each camera reports its battery and how hot it's running, and the camera list shows them. Viewers with the app open get an alert when a camera's battery drops to 20% while unplugged, when it starts running hot, or when it has been offline for `OFFLINE_ALERT_AFTER_S` (default 120). Stopping a camera from its own screen doesn't count as going offline.
+
 ## 4. Mobile app
 
 ```

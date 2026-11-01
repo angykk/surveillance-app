@@ -39,7 +39,10 @@ create table if not exists devices (
   created_at real not null,
   last_seen_at real,
   revoked_at real,
-  detection_mode text not null default 'person'
+  detection_mode text not null default 'person',
+  battery_level integer,
+  battery_charging integer,
+  thermal_state text
 );
 create table if not exists pairing_codes (
   code text primary key,
@@ -78,7 +81,12 @@ end;
 
 # Columns added after the first local databases were made: table -> (column, type).
 _ADDED_COLUMNS = {
-    'devices': (('detection_mode', "text not null default 'person'"),),
+    'devices': (
+        ('detection_mode', "text not null default 'person'"),
+        ('battery_level', 'integer'),
+        ('battery_charging', 'integer'),
+        ('thermal_state', 'text'),
+    ),
     'motion_events': (
         ('thumb_key', 'text'),
         ('thumb_size_bytes', 'integer'),
@@ -104,8 +112,9 @@ class SQLiteClient:
         self._conn.executescript(SCHEMA)
 
     def _add_missing_columns(self):
-        """Brings a database made before thumbnails or detection labels up to
-        date; `create table if not exists` leaves an existing table as it was."""
+        """Brings a database made before thumbnails, detection labels or
+        camera health up to date; `create table if not exists` leaves an
+        existing table as it was."""
         for table, added in _ADDED_COLUMNS.items():
             columns = {row['name'] for row in self._conn.execute(f'pragma table_info({table})')}
             if columns:

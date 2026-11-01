@@ -5,6 +5,7 @@ from flask import request
 from flask_socketio import SocketIO, disconnect
 
 import auth
+import camera_health
 import clip_storage
 import db
 import livekit_rooms
@@ -47,9 +48,16 @@ socketio = SocketIO()
 # A camera's settings (for now, its detection mode) are pushed to it as
 # `settings` when it connects and whenever they change from Viewer Mode.
 #
+# Cameras report their health (battery and temperature, see
+# camera_health.py) as `camera-health`, which is kept on the device row and
+# shown in rosters. Viewers get a `camera-alert` when a camera's battery runs
+# low, it starts running hot, or it has been offline for
+# OFFLINE_ALERT_AFTER_S. A camera stopped on purpose sends `camera-stopping`
+# first, so that doesn't count as going offline.
+#
 # This presence state is per-process, so the server must run as a single
 # instance until it moves to Redis.
-cameras = {}  # device_id -> {'sid': str, 'name': str, 'household_id': str, 'motion_event_id': str | None, 'streaming': bool}
+cameras = {}  # device_id -> {'sid': str, 'name': str, 'household_id': str, 'motion_event_id': str | None, 'streaming': bool, 'health': dict | None, 'stopping': bool}
 viewers = {}  # viewer_sid -> {'user_id': str, 'households': set, 'watching': device_id | None}
 
 # Socket events and HTTP requests run on different threads (async_mode
@@ -57,6 +65,16 @@ viewers = {}  # viewer_sid -> {'user_id': str, 'households': set, 'watching': de
 # every entry point into this module holds this lock. It's reentrant because
 # a server-side disconnect runs `on_disconnect` right away, on the same thread.
 _lock = threading.RLock()
+
+# How long a camera that dropped off unexpectedly may stay offline before
+# its household is alerted. Long enough to ride out a network blip or a
+# moment in the background (pulling down the control centre pauses the app).
+# Set from OFFLINE_ALERT_AFTER_S by app.py.
+offline_alert_after_s = 120
+
+# device_id -> the pending offline alert for a camera that dropped off.
+# In memory, so a server restart forgets them.
+_offline_timers = {}
 
 
 def _locked(fn):
@@ -75,7 +93,7 @@ def _roster(household_ids):
         return []
     rows = (
         db.table('devices')
-        .select('id, name, detection_mode, household_id, last_seen_at, households(name)')
+        .select(f"id, name, detection_mode, household_id, last_seen_at, {', '.join(camera_health.COLUMNS)}, households(name)")
         .in_('household_id', list(household_ids))
         .is_('revoked_at', 'null')
         .order('created_at')
@@ -91,6 +109,8 @@ def _roster(household_ids):
             'household_name': row['households']['name'],
             'online': row['id'] in cameras,
             'last_seen_at': row['last_seen_at'],
+            # Current while online; as of `last_seen_at` while offline.
+            'health': camera_health.from_row(row),
         }
         for row in rows
     ]
@@ -151,6 +171,7 @@ def device_revoked(device_id, household_id):
     """Kicks a just-revoked camera off immediately rather than waiting for
     it to reconnect; its token no longer passes `auth.device_for_token`, so
     it can't come back."""
+    _cancel_offline_alert(device_id)
     camera = _drop_camera(device_id)
     if camera is not None:
         socketio.server.disconnect(camera['sid'], namespace='/')
@@ -195,7 +216,10 @@ def on_connect(auth_payload):
             'household_id': device['household_id'],
             'motion_event_id': None,
             'streaming': False,
+            'health': camera_health.from_row(device),
+            'stopping': False,
         }
+        _cancel_offline_alert(device['id'])
         _set_last_seen(device['id'])
         print(f"Camera '{device['name']}' ({device['id']}) connected: {request.sid}")
         socketio.emit('settings', _settings(device), to=request.sid)
@@ -225,6 +249,8 @@ def on_disconnect(*_):
         camera = _drop_camera(device_id)
         print(f"Camera '{camera['name']}' ({device_id}) disconnected: {request.sid}")
         _set_last_seen(device_id)
+        if not camera['stopping']:
+            _schedule_offline_alert(device_id)
         broadcast_roster(camera['household_id'])
         return
 
@@ -247,6 +273,75 @@ def _drop_camera(device_id):
             viewer['watching'] = None
             socketio.emit('peer-left', to=viewer_sid)
     return camera
+
+
+def _schedule_offline_alert(device_id):
+    _cancel_offline_alert(device_id)
+    timer = threading.Timer(offline_alert_after_s, _offline_alert_due, args=(device_id,))
+    timer.daemon = True
+    _offline_timers[device_id] = timer
+    timer.start()
+
+
+def _cancel_offline_alert(device_id):
+    timer = _offline_timers.pop(device_id, None)
+    if timer is not None:
+        timer.cancel()
+
+
+@_locked
+def _offline_alert_due(device_id):
+    """Alerts the household if the camera is still offline, and still
+    paired: one removed meanwhile went away on purpose."""
+    if _offline_timers.pop(device_id, None) is None or device_id in cameras:
+        return
+    device = db.first(
+        db.table('devices').select('id, name, household_id').eq('id', device_id).is_('revoked_at', 'null').execute()
+    )
+    if device is not None:
+        _send_alert(device['household_id'], device_id, device['name'], 'offline')
+
+
+def _send_alert(household_id, device_id, name, kind):
+    """Tells the household's connected viewers about a camera problem
+    ('offline', 'battery-low' or 'hot'). Push notifications will go out
+    from here too, for members without the app open."""
+    print(f"Alert for camera '{name}' ({device_id}): {kind}")
+    alert = {'kind': kind, 'camera_id': device_id, 'camera_name': name, 'at': db.now()}
+    for viewer_sid in _household_viewer_sids(household_id):
+        socketio.emit('camera-alert', alert, to=viewer_sid)
+
+
+@socketio.on('camera-health')
+@_locked
+def on_camera_health(data=None):
+    """Stores a camera's health report when it has changed (battery level
+    moves a percent every few minutes), updates rosters and sends any alerts
+    the change calls for."""
+    device_id = _camera_id_of_sid(request.sid)
+    if device_id is None:
+        return
+    camera = cameras[device_id]
+    health = camera_health.parse_report(data)
+    previous = camera['health']
+    if health == previous:
+        return
+    camera['health'] = health
+    db.table('devices').update(health).eq('id', device_id).execute()
+    broadcast_roster(camera['household_id'])
+    for kind in camera_health.alerts_for(previous, health):
+        _send_alert(camera['household_id'], device_id, camera['name'], kind)
+
+
+@socketio.on('camera-stopping')
+@_locked
+def on_camera_stopping(*_):
+    """The camera is being stopped from its own screen, so its disconnect
+    isn't a camera gone missing. Acked, so the camera can wait for it."""
+    device_id = _camera_id_of_sid(request.sid)
+    if device_id is not None:
+        cameras[device_id]['stopping'] = True
+    return True
 
 
 def _release_stream(device_id):

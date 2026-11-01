@@ -7,10 +7,12 @@ import '../api/api_client.dart';
 import '../api/motion_api.dart';
 import '../signaling/signaling_client.dart';
 import 'app_theme.dart';
+import 'camera_health_badges.dart';
 import 'camera_list_screen.dart';
 import 'clip_actions.dart';
 import 'motion_timeline.dart';
 import 'shared_widgets.dart';
+import 'time_format.dart';
 
 /// Width of the motion timeline beside the video in landscape.
 const _timelinePanelWidth = 320.0;
@@ -322,9 +324,36 @@ class _ViewerScreenState extends State<ViewerScreen> {
   static List<MotionEvent> _upsert(List<MotionEvent> events, MotionEvent event) =>
       [event, ...events.where((e) => e.id != event.id)]..sort((a, b) => b.startedAt.compareTo(a.startedAt));
 
+  /// The camera's current battery (and a warning while it's running hot),
+  /// over the video. Only while it's online: offline, it's out of date.
+  List<Widget> _healthPills() {
+    final health = _camera.health;
+    if (!_camera.online || health == null) return const [];
+    final level = health.batteryLevel;
+    final batteryColor = health.batteryLow ? AppColors.lightRed : AppColors.white;
+    return [
+      if (level != null)
+        OverlayPill(
+          padding: _pillPadding,
+          icon: Icon(batteryIcon(health), color: batteryColor, size: 14),
+          child: Text(
+            '$level%',
+            semanticsLabel: 'Battery $level%${health.batteryCharging == true ? ', charging' : ''}',
+            style: TextStyle(color: batteryColor, fontWeight: FontWeight.bold),
+          ),
+        ),
+      if (health.runningHot)
+        const OverlayPill(
+          padding: _pillPadding,
+          icon: Icon(Icons.thermostat, color: AppColors.lightRed, size: 14),
+          child: Text('Hot', style: TextStyle(color: AppColors.lightRed, fontWeight: FontWeight.bold)),
+        ),
+    ];
+  }
+
   String _offlineStatus() {
     final lastSeen = _camera.lastSeenAt;
-    return lastSeen == null ? 'Offline' : 'Offline · last seen ${_timeAgo(lastSeen)}';
+    return lastSeen == null ? 'Offline' : 'Offline · last seen ${timeAgo(lastSeen)}';
   }
 
   /// Leaves the camera's room and returns to the waiting state, so a
@@ -484,6 +513,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
                               style: TextStyle(color: AppColors.white, fontWeight: FontWeight.bold),
                             ),
                           ),
+                        ..._healthPills(),
                         if (_motionNow)
                           const OverlayPill(padding: _pillPadding, 
                             icon: PulsingDot(color: AppColors.taupe, size: 10),
@@ -644,12 +674,4 @@ class _VideoPlaceholder extends StatelessWidget {
             ),
     );
   }
-}
-
-String _timeAgo(DateTime time) {
-  final elapsed = DateTime.now().difference(time);
-  if (elapsed.inMinutes < 1) return 'just now';
-  if (elapsed.inHours < 1) return '${elapsed.inMinutes}m ago';
-  if (elapsed.inDays < 1) return '${elapsed.inHours}h ago';
-  return '${elapsed.inDays}d ago';
 }

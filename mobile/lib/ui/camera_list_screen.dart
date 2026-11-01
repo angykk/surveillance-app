@@ -5,13 +5,16 @@ import '../api/households_api.dart';
 import '../auth/session.dart';
 import '../api/motion_api.dart';
 import '../config.dart';
+import '../health/camera_health.dart';
 import '../motion/motion_label.dart';
 import '../signaling/signaling_client.dart';
 import 'app_theme.dart';
+import 'camera_health_badges.dart';
 import 'pairing_code_screen.dart';
 import 'rename_dialog.dart';
 import 'shared_widgets.dart';
 import 'theme_controller.dart';
+import 'time_format.dart';
 import 'viewer_screen.dart';
 
 class CameraInfo {
@@ -23,6 +26,7 @@ class CameraInfo {
     required this.online,
     required this.lastSeenAt,
     this.detectionMode = DetectionMode.person,
+    this.health,
   });
 
   final String id;
@@ -37,6 +41,10 @@ class CameraInfo {
   /// What the camera opens motion events for.
   final DetectionMode detectionMode;
 
+  /// Its battery and temperature: current while online, as of [lastSeenAt]
+  /// while offline. Null if it has never reported them.
+  final CameraHealth? health;
+
   factory CameraInfo.fromJson(Map<dynamic, dynamic> json) => CameraInfo(
         id: json['id'] as String,
         name: json['name'] as String,
@@ -45,7 +53,30 @@ class CameraInfo {
         online: json['online'] as bool,
         lastSeenAt: json['last_seen_at'] == null ? null : dateTimeFromEpochSeconds(json['last_seen_at'] as num),
         detectionMode: DetectionMode.fromName(json['detection_mode']),
+        health: CameraHealth.fromJson(json['health']),
       );
+}
+
+/// A camera problem the server alerts the household about: `camera-alert`.
+class CameraAlert {
+  const CameraAlert({required this.kind, required this.cameraName});
+
+  /// 'offline', 'battery-low' or 'hot'.
+  final String kind;
+  final String cameraName;
+
+  static CameraAlert? fromJson(Object? json) {
+    if (json is! Map || json['kind'] is! String || json['camera_name'] is! String) return null;
+    return CameraAlert(kind: json['kind'] as String, cameraName: json['camera_name'] as String);
+  }
+
+  /// Null for a kind this version of the app doesn't know.
+  String? get message => switch (kind) {
+        'offline' => '$cameraName has gone offline.',
+        'battery-low' => '$cameraName\'s battery is low. Plug it in to keep it recording.',
+        'hot' => '$cameraName is running hot and may slow down or stop.',
+        _ => null,
+      };
 }
 
 /// Viewer Mode's home once signed in: every camera paired into the user's
@@ -114,6 +145,15 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
       // A camera can appear in a household this screen hasn't loaded yet
       // (e.g. created since); refresh so its role is known.
       if (list.any((c) => !_households.containsKey(c.householdId))) _loadHouseholds();
+    });
+    // Shown over whichever Viewer Mode screen is open, a camera's included.
+    // Only while the app is open; push notifications will cover the rest.
+    _signaling.socket.on('camera-alert', (data) {
+      final message = CameraAlert.fromJson(data)?.message;
+      if (message == null || !mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message), duration: const Duration(seconds: 8), showCloseIcon: true),
+      );
     });
 
     _signaling.socket.connect();
@@ -337,18 +377,29 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
     // to a short id so they're distinguishable here.
     final isAmbiguous =
         _cameras.where((c) => c.name == camera.name && c.householdId == camera.householdId).length > 1;
+    final lastSeen = camera.lastSeenAt;
     final status = [
-      camera.online ? 'Online' : 'Offline',
+      camera.online
+          ? 'Online'
+          : lastSeen == null
+              ? 'Offline'
+              : 'Offline · last seen ${timeAgo(lastSeen)}',
       if (showHouseholds) camera.householdName,
       if (isAmbiguous) 'ID ${camera.id.substring(0, 8)}',
     ].join(' · ');
+    final health = camera.health;
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 6),
       child: ListTile(
         contentPadding: const EdgeInsets.only(left: 16, right: 4, top: 4, bottom: 4),
         leading: _CameraLeadingIcon(online: camera.online),
         title: Text(camera.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-        subtitle: Text(status),
+        subtitle: Row(
+          children: [
+            Flexible(child: Text(status, overflow: TextOverflow.ellipsis)),
+            if (health != null) CameraHealthBadges(health: health, online: camera.online),
+          ],
+        ),
         trailing: _canManage(camera)
             ? PopupMenuButton<Object>(
                 onSelected: (action) => switch (action) {

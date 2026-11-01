@@ -12,6 +12,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import '../api/api_client.dart';
 import '../api/motion_api.dart';
 import '../config.dart';
+import '../health/health_monitor.dart';
 import '../motion/motion_detector.dart';
 import '../motion/motion_event_gate.dart';
 import '../motion/motion_label.dart';
@@ -64,6 +65,14 @@ const _eventIdTimeout = Duration(seconds: 10);
 /// retrying whenever the socket reconnects.
 const _clipRetryInterval = Duration(minutes: 2);
 
+/// How often the camera reports its battery and temperature, on top of
+/// reporting on every connect and whenever it's plugged in or unplugged.
+const _healthReportInterval = Duration(minutes: 1);
+
+/// How long stopping the camera waits for the server to acknowledge it's on
+/// purpose, before closing the connection anyway.
+const _stoppingAckTimeout = Duration(seconds: 2);
+
 /// How long after dropping out of its LiveKit room the camera asks the
 /// server to rejoin, so a room that can't be joined at all isn't retried in
 /// a tight loop.
@@ -83,6 +92,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   final _motionGate = MotionEventGate(cooldown: const Duration(seconds: 8));
   late final _clipQueue = ClipUploadQueue(MotionApi(ApiClient.forDevice(AppConfig.serverUrl, widget.credentials.token)));
   Timer? _clipRetryTimer;
+  final _healthMonitor = HealthMonitor();
+  Timer? _healthTimer;
+  StreamSubscription<void>? _pluggedInChanges;
   late final SignalingClient _signaling;
   late DeviceCredentials _credentials = widget.credentials;
 
@@ -144,6 +156,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     // offline) go up as soon as possible.
     _clipQueue.drain();
     _clipRetryTimer = Timer.periodic(_clipRetryInterval, (_) => _clipQueue.drain());
+    _healthTimer = Timer.periodic(_healthReportInterval, (_) => _reportHealth());
+    _pluggedInChanges = _healthMonitor.pluggedInChanges.listen((_) => _reportHealth());
   }
 
   /// Creates the signaling socket and registers its listeners. Registered
@@ -158,6 +172,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       if (mounted) setState(() => _connectionProblem = null);
       // Back online, so whatever piled up meanwhile can go.
       _clipQueue.drain();
+      _reportHealth();
     });
     _signaling.socket.on('disconnect', (reason) {
       // The server forgets which cameras are streaming when one drops off,
@@ -192,6 +207,27 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _signaling.socket.on('settings', (data) {
       if (data is Map) _applyDetectionMode(DetectionMode.fromName(data['detection_mode']));
     });
+  }
+
+  /// Sends this phone's battery and temperature to the server, which shows
+  /// them on viewers' camera lists and alerts them when the battery runs low
+  /// or the phone overheats. It ignores reports that haven't changed.
+  Future<void> _reportHealth() async {
+    if (_disposed || !_signaling.socket.connected) return;
+    final health = await _healthMonitor.read();
+    if (!_disposed && _signaling.socket.connected) _signaling.socket.emit('camera-health', health.toJson());
+  }
+
+  /// Tells the server this camera is being stopped on purpose, so viewers
+  /// aren't alerted that it went offline. Waits briefly for the ack, since
+  /// the connection closes right after.
+  Future<void> _announceStopping() async {
+    if (!_signaling.socket.connected) return;
+    final acked = Completer<void>();
+    _signaling.socket.emitWithAck('camera-stopping', null, ack: (_) {
+      if (!acked.isCompleted) acked.complete();
+    });
+    await acked.future.timeout(_stoppingAckTimeout, onTimeout: () {});
   }
 
   /// People-only needs the person detector; if its model didn't load, any
@@ -268,7 +304,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           'It stays paired, so choosing Camera Mode again picks up where it left off.',
       confirmLabel: 'Stop camera',
     );
-    if (confirmed) widget.onSwitchMode();
+    if (!confirmed) return;
+    await _announceStopping();
+    widget.onSwitchMode();
   }
 
   @override
@@ -651,6 +689,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
     _clipRetryTimer?.cancel();
+    _healthTimer?.cancel();
+    _pluggedInChanges?.cancel();
     SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     _motionDetector.dispose();

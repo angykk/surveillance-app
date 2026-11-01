@@ -36,6 +36,8 @@ def app(tmp_path, closed_rooms):
     yield app
     signaling.cameras.clear()
     signaling.viewers.clear()
+    for device_id in list(signaling._offline_timers):
+        signaling._cancel_offline_alert(device_id)
 
 
 @pytest.fixture

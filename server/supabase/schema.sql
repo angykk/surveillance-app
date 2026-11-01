@@ -46,11 +46,22 @@ create table if not exists public.devices (
   -- Which motion opens an event: 'person' (only once the camera's person
   -- detector sees someone) or 'any'. Set from Viewer Mode, pushed to the
   -- camera as `settings`.
-  detection_mode text not null default 'person' check (detection_mode in ('person', 'any'))
+  detection_mode text not null default 'person' check (detection_mode in ('person', 'any')),
+  -- The camera's last health report (camera_health.py), null until its
+  -- first: battery percent, whether it's plugged in, and how hot the phone
+  -- is running, as iOS's thermal state levels.
+  battery_level smallint check (battery_level between 0 and 100),
+  battery_charging boolean,
+  thermal_state text check (thermal_state in ('nominal', 'fair', 'serious', 'critical'))
 );
--- For a table created before detection modes were added.
+-- For a table created before detection modes or health reports were added.
 alter table public.devices add column if not exists detection_mode text not null default 'person'
   check (detection_mode in ('person', 'any'));
+alter table public.devices add column if not exists battery_level smallint
+  check (battery_level between 0 and 100);
+alter table public.devices add column if not exists battery_charging boolean;
+alter table public.devices add column if not exists thermal_state text
+  check (thermal_state in ('nominal', 'fair', 'serious', 'critical'));
 create index if not exists devices_household_id_idx on public.devices (household_id);
 
 create table if not exists public.pairing_codes (

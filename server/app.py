@@ -37,6 +37,9 @@ def create_app(overrides=None):
         # them forever); checked every RETENTION_INTERVAL_S.
         RETENTION_DAYS=int(os.environ.get('RETENTION_DAYS') or '30'),
         RETENTION_INTERVAL_S=int(os.environ.get('RETENTION_INTERVAL_S') or '3600'),
+        # A camera that drops off without being stopped from its own screen
+        # alerts its household once it has been offline this long.
+        OFFLINE_ALERT_AFTER_S=int(os.environ.get('OFFLINE_ALERT_AFTER_S') or '120'),
         SUPABASE_URL=os.environ.get('SUPABASE_URL', ''),
         SUPABASE_KEY=os.environ.get('SUPABASE_KEY', ''),
         SUPABASE_JWT_SECRET=os.environ.get('SUPABASE_JWT_SECRET', ''),
@@ -73,6 +76,7 @@ def create_app(overrides=None):
     else:
         raise RuntimeError('Set SUPABASE_KEY (the secret key), or SQLITE_PATH for a local database, in .env.')
     signaling.close_orphaned_motion_events()
+    signaling.offline_alert_after_s = app.config['OFFLINE_ALERT_AFTER_S']
 
     if not (app.config['LIVEKIT_URL'] and app.config['LIVEKIT_API_KEY'] and app.config['LIVEKIT_API_SECRET']):
         raise RuntimeError('Set LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET in .env for live video.')
