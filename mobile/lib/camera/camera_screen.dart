@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -19,6 +20,7 @@ import '../motion/motion_label.dart';
 import '../ui/app_theme.dart';
 import '../ui/rename_dialog.dart';
 import '../ui/shared_widgets.dart';
+import '../signaling/camera_controls.dart';
 import '../signaling/signaling_client.dart';
 import 'clip_upload_queue.dart';
 import 'device_credentials.dart';
@@ -134,6 +136,13 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   String? _errorMessage;
   bool _permissionPermanentlyDenied = false;
   bool _isLiveToViewer = false;
+
+  /// Whether a viewer is talking through this phone's speaker right now.
+  bool _viewerTalking = false;
+
+  /// The torch and lens viewers can change remotely. Both reset whenever the
+  /// camera is (re)opened, to the rear lens with the torch off.
+  CameraControls _controls = const CameraControls();
   bool _motionActive = false;
   _Clip? _clip;
 
@@ -173,6 +182,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       // Back online, so whatever piled up meanwhile can go.
       _clipQueue.drain();
       _reportHealth();
+      _reportControls();
     });
     _signaling.socket.on('disconnect', (reason) {
       // The server forgets which cameras are streaming when one drops off,
@@ -207,6 +217,77 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     _signaling.socket.on('settings', (data) {
       if (data is Map) _applyDetectionMode(DetectionMode.fromName(data['detection_mode']));
     });
+    // A viewer's remote control. The server waits for the answer, so the
+    // payload arrives as `[command, ack]`.
+    _signaling.socket.on('control', (args) {
+      if (args is! List || args.length < 2 || args.last is! Function) return;
+      final ack = args.last as Function;
+      final command = args.first;
+      _runControl(command is Map ? command : const {}).then((answer) => ack(answer));
+    });
+  }
+
+  /// Carries out a viewer's remote control, answering `{'ok': true}`, a
+  /// snapshot's `{'jpeg': <base64>}`, or `{'error': ...}`.
+  Future<Map<String, dynamic>> _runControl(Map command) async {
+    final track = _videoTrack;
+    if (track == null || _status != _Status.ready) return {'error': 'not-ready'};
+    try {
+      switch (ControlAction.fromName(command['action'])) {
+        case ControlAction.torch:
+          if (!_controls.hasTorch) return {'error': 'no-torch'};
+          final on = command['on'] == true;
+          await track.mediaStreamTrack.setTorch(on);
+          _setControls(CameraControls(torch: on, hasTorch: true, lens: _controls.lens));
+          return {'ok': true};
+        case ControlAction.switchLens:
+          // Swaps the lens under the same track, so the room, clip recording
+          // and motion checks keep going without a restart.
+          await rtc.Helper.switchCamera(track.mediaStreamTrack);
+          if (_videoTrack != track) return {'error': 'not-ready'};
+          // The whole picture changes, which isn't motion.
+          _motionDetector.reset();
+          final lens = _controls.lens == CameraLens.back ? CameraLens.front : CameraLens.back;
+          // The torch belongs to the lens that was switched away from.
+          _setControls(CameraControls(hasTorch: await _hasTorch(track), lens: lens));
+          return {'ok': true};
+        case ControlAction.snapshot:
+          final frame = await track.mediaStreamTrack.captureFrame().timeout(_captureTimeout);
+          final jpeg = await encodeSnapshot(frame.asUint8List());
+          if (jpeg == null) return {'error': 'failed'};
+          return {'jpeg': base64Encode(jpeg)};
+        case null:
+          return {'error': 'unknown-action'};
+      }
+    } catch (e) {
+      debugPrint('Remote control ${command['action']} failed: $e');
+      return {'error': 'failed'};
+    }
+  }
+
+  static Future<bool> _hasTorch(LocalVideoTrack track) async {
+    try {
+      return await track.mediaStreamTrack.hasTorch();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// A freshly opened camera is on the rear lens with the torch off.
+  Future<void> _resetControls(LocalVideoTrack track) async {
+    final hasTorch = await _hasTorch(track);
+    if (_videoTrack == track) _setControls(CameraControls(hasTorch: hasTorch));
+  }
+
+  void _setControls(CameraControls controls) {
+    _controls = controls;
+    if (mounted && !_disposed) setState(() {});
+    _reportControls();
+  }
+
+  /// Tells the server the torch and lens state, for viewers' buttons.
+  void _reportControls() {
+    if (!_disposed && _signaling.socket.connected) _signaling.socket.emit('camera-controls', _controls.toJson());
   }
 
   /// Sends this phone's battery and temperature to the server, which shows
@@ -362,6 +443,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
     _videoTrack = video;
     _audioTrack = audio;
+    unawaited(_resetControls(video));
 
     _stalledCaptures = 0;
     _motionDetector.reset();
@@ -538,9 +620,15 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         defaultVideoPublishOptions: VideoPublishOptions(simulcast: false),
       ),
     );
+    // Viewers talking through the camera play out of the speaker by
+    // themselves; these only keep the TALKING pill current.
     final listener = room.createListener()
       ..on<ParticipantConnectedEvent>((_) => _updateLive())
       ..on<ParticipantDisconnectedEvent>((_) => _updateLive())
+      ..on<TrackSubscribedEvent>((_) => _updateTalking())
+      ..on<TrackUnsubscribedEvent>((_) => _updateTalking())
+      ..on<TrackMutedEvent>((_) => _updateTalking())
+      ..on<TrackUnmutedEvent>((_) => _updateTalking())
       ..on<RoomDisconnectedEvent>((_) => _onRoomLost(room));
     _room = room;
     _roomListener = listener;
@@ -590,6 +678,16 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   void _updateLive() {
     final live = _room?.remoteParticipants.isNotEmpty ?? false;
     if (mounted && !_disposed && live != _isLiveToViewer) setState(() => _isLiveToViewer = live);
+    _updateTalking();
+  }
+
+  /// TALKING shows while any viewer's mic is on, so whoever is near the
+  /// camera knows the voice is live.
+  void _updateTalking() {
+    final talking = _room?.remoteParticipants.values
+            .any((p) => p.audioTrackPublications.any((pub) => pub.subscribed && !pub.muted)) ??
+        false;
+    if (mounted && !_disposed && talking != _viewerTalking) setState(() => _viewerTalking = talking);
   }
 
   /// Leaves the room (if in one), then reopens the camera and mic if leaving
@@ -626,6 +724,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       final (video, audio) = await _openTracks();
       _videoTrack = video;
       _audioTrack = audio;
+      unawaited(_resetControls(video));
     } catch (e) {
       _showStartError(e);
       return;
@@ -758,14 +857,28 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
                       ],
                     ),
                     const Spacer(),
-                    if (ready && _motionActive)
-                      const OverlayPill(
-                        icon: Icon(Icons.directions_run, color: AppColors.taupe, size: 14),
-                        child: Text(
-                          'MOTION · REC',
-                          style: TextStyle(color: AppColors.white, fontWeight: FontWeight.bold),
-                        ),
-                      ),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        if (ready && _viewerTalking)
+                          const OverlayPill(
+                            icon: Icon(Icons.record_voice_over, color: AppColors.lightRed, size: 14),
+                            child: Text(
+                              'VIEWER TALKING',
+                              style: TextStyle(color: AppColors.white, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        if (ready && _motionActive)
+                          const OverlayPill(
+                            icon: Icon(Icons.directions_run, color: AppColors.taupe, size: 14),
+                            child: Text(
+                              'MOTION · REC',
+                              style: TextStyle(color: AppColors.white, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                      ],
+                    ),
                   ],
                 ),
               ),

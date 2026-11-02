@@ -1,10 +1,16 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:livekit_client/livekit_client.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:video_player/video_player.dart';
 
 import '../api/api_client.dart';
 import '../api/motion_api.dart';
+import '../signaling/camera_controls.dart';
 import '../signaling/signaling_client.dart';
 import 'app_theme.dart';
 import 'camera_health_badges.dart';
@@ -16,6 +22,10 @@ import 'time_format.dart';
 
 /// Width of the motion timeline beside the video in landscape.
 const _timelinePanelWidth = 320.0;
+
+/// How long a remote control waits for its ack. Longer than the server's own
+/// wait for the camera (10 s), so the server's `timeout` answer arrives first.
+const _controlAckTimeout = Duration(seconds: 15);
 
 /// Watches a single camera over an already-connected [SignalingClient] that
 /// the caller (CameraListScreen) owns — this screen pairs with `camera` via
@@ -29,7 +39,11 @@ const _timelinePanelWidth = 320.0;
 /// landscape the video takes the screen with the timeline as a side panel.
 /// Tapping an event with a clip plays it in the video panel in place of the
 /// live feed, until "Back to live". A clip can be shared from its row or
-/// while it plays, and owners and admins ([canManage]) can delete it. Offline cameras open here too: the
+/// while it plays, and owners and admins ([canManage]) can delete it.
+///
+/// While live, a control bar lets any household member talk through the
+/// camera (tap to start and stop), turn its torch on or off, switch its lens
+/// and take a snapshot. Offline cameras open here too: the
 /// timeline and clips still work, and the stream starts by itself once the
 /// camera comes back online.
 class ViewerScreen extends StatefulWidget {
@@ -64,6 +78,14 @@ class _ViewerScreenState extends State<ViewerScreen> {
 
   String _status = 'Connecting…';
   bool _isLive = false;
+
+  /// Whether this viewer's mic is on, talking through the camera.
+  bool _talking = false;
+
+  /// A remote control waiting for the camera, so its button isn't pressed
+  /// twice meanwhile.
+  ControlAction? _pendingControl;
+  bool _talkPending = false;
 
   /// Whether a `watch-camera` is outstanding or answered, so a roster update
   /// arriving right after one doesn't send a second.
@@ -178,6 +200,12 @@ class _ViewerScreenState extends State<ViewerScreen> {
 
     try {
       await room.connect(grant.url, grant.token);
+      // Only the camera may hear this viewer talk, not other household
+      // members watching it (who'd also hear it again from the camera).
+      room.localParticipant?.setTrackSubscriptionPermissions(
+        allParticipantsAllowed: false,
+        trackPermissions: [ParticipantTrackPermission('camera:${_camera.id}', true, null)],
+      );
     } catch (e) {
       debugPrint('Joining LiveKit room failed: $e');
       if (_room == room) _resetToWaiting('Could not connect to the live stream');
@@ -192,6 +220,8 @@ class _ViewerScreenState extends State<ViewerScreen> {
     _roomListener = null;
     _videoTrack = null;
     _audioTrack = null;
+    // Leaving the room takes the mic with it.
+    _talking = false;
     await listener?.dispose();
     await room?.disconnect();
     await room?.dispose();
@@ -252,9 +282,86 @@ class _ViewerScreenState extends State<ViewerScreen> {
     }
   }
 
+  /// Turns this viewer's mic on or off in the camera's room. The camera
+  /// plays it out of its speaker.
+  Future<void> _toggleTalk() async {
+    final participant = _room?.localParticipant;
+    if (participant == null || _talkPending) return;
+    final talk = !_talking;
+    if (talk && !await Permission.microphone.request().isGranted) {
+      _showMessage('Allow microphone access in Settings to talk through the camera.');
+      return;
+    }
+    setState(() => _talkPending = true);
+    try {
+      await participant.setMicrophoneEnabled(talk);
+      if (mounted && _room?.localParticipant == participant) setState(() => _talking = talk);
+    } catch (e) {
+      _showMessage('Could not ${talk ? 'turn on' : 'turn off'} the microphone: $e');
+    } finally {
+      if (mounted) setState(() => _talkPending = false);
+    }
+  }
+
+  Future<void> _stopTalking() async {
+    if (!_talking) return;
+    setState(() => _talking = false);
+    try {
+      await _room?.localParticipant?.setMicrophoneEnabled(false);
+    } catch (e) {
+      debugPrint('Turning off the microphone failed: $e');
+    }
+  }
+
+  /// Sends the camera a remote control and returns its answer, or null
+  /// (after telling the user why) if it didn't work.
+  Future<Map?> _sendControl(ControlAction action, {bool? on}) async {
+    if (_pendingControl != null) return null;
+    setState(() => _pendingControl = action);
+    final answer = Completer<Object?>();
+    _signaling.socket.emitWithAck(
+      'camera-control',
+      {'camera_id': _camera.id, 'action': action.wireName, 'on': ?on},
+      ack: (data) {
+        if (!answer.isCompleted) answer.complete(data);
+      },
+    );
+    final data = await answer.future.timeout(_controlAckTimeout, onTimeout: () => const {'error': 'timeout'});
+    if (!mounted) return null;
+    setState(() => _pendingControl = null);
+    if (data is! Map || data['error'] != null) {
+      _showMessage(controlErrorMessage(data is Map ? data['error'] : null));
+      return null;
+    }
+    return data;
+  }
+
+  Future<void> _takeSnapshot() async {
+    final answer = await _sendControl(ControlAction.snapshot);
+    final encoded = answer?['jpeg'];
+    if (encoded is! String || !mounted) return;
+    final Uint8List jpeg;
+    try {
+      jpeg = base64Decode(encoded);
+    } on FormatException {
+      _showMessage(controlErrorMessage(null));
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (context) => _SnapshotDialog(jpeg: jpeg, cameraName: _camera.name, takenAt: DateTime.now()),
+    );
+  }
+
+  void _showMessage(String message) {
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
   Future<void> _playClip(MotionEvent event) async {
     if (_clipEvent?.id == event.id) return;
     _backToLive();
+    // The live view (and so talking) is out of sight while a clip plays.
+    _stopTalking();
     setState(() => _clipEvent = event);
     _setLiveAudio(false);
     try {
@@ -365,6 +472,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
       setState(() {
         _videoTrack = null;
         _isLive = false;
+        _talking = false;
         _status = status;
       });
       await WidgetsBinding.instance.endOfFrame;
@@ -463,6 +571,13 @@ class _ViewerScreenState extends State<ViewerScreen> {
               status: _status,
               offline: !_camera.online,
               onRetry: _camera.online || !_signaling.socket.connected ? _retry : null,
+            ),
+          if (_clipEvent == null && _isLive && _videoTrack != null)
+            SafeArea(
+              top: false,
+              right: !(landscape && _showTimeline),
+              bottom: landscape,
+              child: Align(alignment: Alignment.bottomRight, child: _buildLiveControls()),
             ),
           SafeArea(
             right: !(landscape && _showTimeline),
@@ -564,6 +679,85 @@ class _ViewerScreenState extends State<ViewerScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  /// Talk, torch, lens and snapshot, over the bottom of the live feed.
+  Widget _buildLiveControls() {
+    final controls = _camera.controls ?? const CameraControls();
+    final busy = _pendingControl != null;
+    return Padding(
+      padding: const EdgeInsets.all(8),
+      child: Wrap(
+        spacing: 8,
+        children: [
+          OverlayButton(
+            icon: _talking ? Icons.mic : Icons.mic_none,
+            tooltip: _talking ? 'Stop talking' : 'Talk through camera',
+            active: _talking,
+            onPressed: _talkPending ? null : _toggleTalk,
+          ),
+          OverlayButton(
+            icon: controls.torch ? Icons.flashlight_on : Icons.flashlight_off,
+            tooltip: !controls.hasTorch
+                ? 'No torch on this lens'
+                : controls.torch
+                    ? 'Turn torch off'
+                    : 'Turn torch on',
+            active: controls.torch,
+            onPressed:
+                busy || !controls.hasTorch ? null : () => _sendControl(ControlAction.torch, on: !controls.torch),
+          ),
+          OverlayButton(
+            icon: Icons.cameraswitch_outlined,
+            tooltip: controls.lens == CameraLens.back ? 'Switch to front lens' : 'Switch to rear lens',
+            onPressed: busy ? null : () => _sendControl(ControlAction.switchLens),
+          ),
+          OverlayButton(
+            icon: Icons.photo_camera_outlined,
+            tooltip: 'Take snapshot',
+            onPressed: busy ? null : _takeSnapshot,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// A snapshot the camera just took, with a share button (which on iOS
+/// includes saving it to Photos).
+class _SnapshotDialog extends StatelessWidget {
+  const _SnapshotDialog({required this.jpeg, required this.cameraName, required this.takenAt});
+
+  final Uint8List jpeg;
+  final String cameraName;
+  final DateTime takenAt;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('$cameraName · ${DateFormat.jm().format(takenAt)}'),
+      contentPadding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+      content: ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.memory(jpeg, fit: BoxFit.contain, gaplessPlayback: true),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Close')),
+        Builder(
+          builder: (buttonContext) => FilledButton.icon(
+            onPressed: () => shareSnapshot(
+              context,
+              jpeg: jpeg,
+              cameraName: cameraName,
+              takenAt: takenAt,
+              origin: buttonContext,
+            ),
+            icon: const Icon(Icons.ios_share),
+            label: const Text('Share'),
+          ),
+        ),
+      ],
     );
   }
 }

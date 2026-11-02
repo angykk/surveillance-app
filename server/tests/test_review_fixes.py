@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import io
 import json
 import os
@@ -74,9 +75,15 @@ def test_every_socket_handler_holds_the_state_lock():
     `viewers` while another thread is iterating them."""
     with open(signaling.__file__) as f:
         source = f.read()
-    handlers = re.findall(r"@socketio\.on\('([^']+)'\)\n(@_locked\n)?def ", source)
+    handlers = re.findall(r"@socketio\.on\('([^']+)'\)\n(@_locked\n)?def (\w+)", source)
     assert handlers
-    assert [event for event, locked in handlers if not locked] == []
+    unlocked = [
+        event for event, locked, name in handlers
+        # A handler that waits on a client takes the lock itself, around
+        # everything but the wait.
+        if not locked and 'with _lock:' not in inspect.getsource(getattr(signaling, name))
+    ]
+    assert unlocked == []
 
 
 def test_connects_from_other_threads_wait_for_the_state_lock(app, client, monkeypatch):

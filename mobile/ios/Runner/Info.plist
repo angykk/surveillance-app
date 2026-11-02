@@ -29,7 +29,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Camera access is needed to use this device as a security camera.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Microphone access is needed to record audio alongside video.</string>
+	<string>Microphone access is needed to record audio alongside video, and to talk through a camera.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>

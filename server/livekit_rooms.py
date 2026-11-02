@@ -7,7 +7,9 @@ from livekit import api
 # Live video goes through a LiveKit SFU, one room per camera (room name =
 # device id). This server never touches media: it only hands out access
 # tokens once signaling.py has checked household membership, and closes a
-# room when its camera is revoked.
+# room when its camera is revoked. Viewers may publish a mic too, to talk
+# through the camera; they only let the camera subscribe to it (see the
+# viewer screen), so household members don't hear each other.
 #
 # Named livekit_rooms rather than livekit so it doesn't shadow the package.
 
@@ -22,7 +24,7 @@ def init(url, api_key, api_secret):
     _config.update(url=url, api_key=api_key, api_secret=api_secret)
 
 
-def _grant(identity, name, room, *, publish):
+def _grant(identity, name, room, *, sources):
     token = (
         api.AccessToken(_config['api_key'], _config['api_secret'])
         .with_identity(identity)
@@ -31,8 +33,9 @@ def _grant(identity, name, room, *, publish):
         .with_grants(api.VideoGrants(
             room_join=True,
             room=room,
-            can_publish=publish,
-            can_subscribe=not publish,
+            can_publish=True,
+            can_publish_sources=sources,
+            can_subscribe=True,
             can_publish_data=False,
         ))
         .to_jwt()
@@ -40,18 +43,26 @@ def _grant(identity, name, room, *, publish):
     return {'url': _config['url'], 'token': token}
 
 
+def camera_identity(device_id):
+    """A fixed identity per camera means a reconnecting camera replaces its
+    own stale participant rather than joining twice. Viewers rely on this
+    format to let only the camera hear them talk."""
+    return f'camera:{device_id}'
+
+
 def camera_grant(device_id, name):
-    """Publish-only. A fixed identity per camera means a reconnecting camera
-    replaces its own stale participant rather than joining twice."""
-    return _grant(f'camera:{device_id}', name, device_id, publish=True)
+    """Publishes the camera and mic, and subscribes so the camera can play
+    back viewers talking through it."""
+    return _grant(camera_identity(device_id), name, device_id, sources=['camera', 'microphone'])
 
 
 def viewer_grant(device_id, user_id, sid):
-    """Subscribe-only. LiveKit kicks a duplicate identity, so each grant gets
-    its own: the socket id lets the same user watch from two phones at once,
-    and the random suffix keeps a viewer that backs out and straight back in
+    """Subscribes to the camera, and may publish a mic only, for talking
+    through it. LiveKit kicks a duplicate identity, so each grant gets its
+    own: the socket id lets the same user watch from two phones at once, and
+    the random suffix keeps a viewer that backs out and straight back in
     (same socket) from colliding with its own session that's still leaving."""
-    return _grant(f'viewer:{user_id}:{sid}:{secrets.token_hex(4)}', 'viewer', device_id, publish=False)
+    return _grant(f'viewer:{user_id}:{sid}:{secrets.token_hex(4)}', 'viewer', device_id, sources=['microphone'])
 
 
 def close_room(device_id):

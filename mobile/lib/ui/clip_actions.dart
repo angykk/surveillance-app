@@ -1,4 +1,9 @@
+import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../api/motion_api.dart';
@@ -29,6 +34,34 @@ Future<void> shareClip(
     messenger
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text('Could not share clip: $e')));
+  }
+}
+
+/// Opens the system share sheet with a snapshot a camera took; on iOS it
+/// has "Save Image" (into Photos). [origin] is as for [shareClip].
+Future<void> shareSnapshot(
+  BuildContext context, {
+  required Uint8List jpeg,
+  required String cameraName,
+  required DateTime takenAt,
+  required BuildContext origin,
+}) async {
+  final messenger = ScaffoldMessenger.of(context);
+  final box = origin.findRenderObject() as RenderBox?;
+  final originRect = box == null ? null : box.localToGlobal(Offset.zero) & box.size;
+  try {
+    // Cleared on each share, like shared clips.
+    final dir = Directory('${(await getTemporaryDirectory()).path}/shared-snapshots');
+    if (await dir.exists()) await dir.delete(recursive: true);
+    await dir.create(recursive: true);
+    final name = cameraName.replaceAll(RegExp(r'[^\w-]+'), '-');
+    final file = File('${dir.path}/$name-${DateFormat('yyyyMMdd-HHmmss').format(takenAt)}.jpg');
+    await file.writeAsBytes(jpeg);
+    await SharePlus.instance.share(
+      ShareParams(files: [XFile(file.path, mimeType: 'image/jpeg')], sharePositionOrigin: originRect),
+    );
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('Could not share snapshot: $e')));
   }
 }
 

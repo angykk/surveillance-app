@@ -55,9 +55,17 @@ socketio = SocketIO()
 # OFFLINE_ALERT_AFTER_S. A camera stopped on purpose sends `camera-stopping`
 # first, so that doesn't count as going offline.
 #
+# Viewers can remote-control a camera they watch with `camera-control`:
+# switch its torch, switch lens, or take a snapshot. The server checks
+# membership and passes it on as `control`, waiting for the camera's answer
+# (for a snapshot, the JPEG itself) to ack the viewer with. The camera
+# reports its torch and lens as `camera-controls`, which rosters carry while
+# it's online so every viewer's buttons show the current state. Talking
+# through the camera needs nothing here: it's a mic track in the LiveKit room.
+#
 # This presence state is per-process, so the server must run as a single
 # instance until it moves to Redis.
-cameras = {}  # device_id -> {'sid': str, 'name': str, 'household_id': str, 'motion_event_id': str | None, 'streaming': bool, 'health': dict | None, 'stopping': bool}
+cameras = {}  # device_id -> {'sid': str, 'name': str, 'household_id': str, 'motion_event_id': str | None, 'streaming': bool, 'health': dict | None, 'stopping': bool, 'controls': dict | None}
 viewers = {}  # viewer_sid -> {'user_id': str, 'households': set, 'watching': device_id | None}
 
 # Socket events and HTTP requests run on different threads (async_mode
@@ -111,6 +119,8 @@ def _roster(household_ids):
             'last_seen_at': row['last_seen_at'],
             # Current while online; as of `last_seen_at` while offline.
             'health': camera_health.from_row(row),
+            # Torch and lens, while online (until the camera first reports them, None).
+            'controls': cameras[row['id']]['controls'] if row['id'] in cameras else None,
         }
         for row in rows
     ]
@@ -218,6 +228,7 @@ def on_connect(auth_payload):
             'streaming': False,
             'health': camera_health.from_row(device),
             'stopping': False,
+            'controls': None,
         }
         _cancel_offline_alert(device['id'])
         _set_last_seen(device['id'])
@@ -342,6 +353,69 @@ def on_camera_stopping(*_):
     if device_id is not None:
         cameras[device_id]['stopping'] = True
     return True
+
+
+LENSES = ('back', 'front')
+CONTROL_ACTIONS = ('torch', 'switch-lens', 'snapshot')
+
+# How long a viewer's `camera-control` waits for the camera to answer. A
+# snapshot is the slowest: a frame grab plus a JPEG encode on the phone.
+control_timeout_s = 10
+
+
+@socketio.on('camera-controls')
+@_locked
+def on_camera_controls(data=None):
+    """Keeps the camera's torch and lens state, for viewers' buttons."""
+    device_id = _camera_id_of_sid(request.sid)
+    if device_id is None or not isinstance(data, dict):
+        return
+    camera = cameras[device_id]
+    controls = {
+        'torch': data.get('torch') is True,
+        'has_torch': data.get('has_torch') is True,
+        'lens': data.get('lens') if data.get('lens') in LENSES else 'back',
+    }
+    if controls != camera['controls']:
+        camera['controls'] = controls
+        broadcast_roster(camera['household_id'])
+
+
+def _ask_camera(camera_sid, command):
+    """Sends a camera a `control` and waits for its answer. Separate so tests,
+    whose socket clients can't answer the server, can stand in for it."""
+    return socketio.call('control', command, to=camera_sid, timeout=control_timeout_s)
+
+
+@socketio.on('camera-control')
+def on_camera_control(data=None):
+    """Passes a viewer's remote control (`{'camera_id', 'action', 'on'}`) on
+    to the camera and acks with its answer, or `{'error': ...}`."""
+    data = data if isinstance(data, dict) else {}
+    action = data.get('action')
+    with _lock:
+        viewer = viewers.get(request.sid)
+        if viewer is None:
+            return None
+        device_id = data.get('camera_id')
+        camera = cameras.get(device_id)
+        # Like `watch-camera`, someone else's camera looks offline.
+        if camera is None or camera['household_id'] not in viewer['households']:
+            return {'error': 'offline'}
+        if action not in CONTROL_ACTIONS:
+            return {'error': 'unknown-action'}
+        command = {'action': action}
+        if action == 'torch':
+            command['on'] = data.get('on') is True
+        camera_sid = camera['sid']
+
+    # Not under the lock: the camera may take seconds to answer, and other
+    # handlers (its answer among them) must run meanwhile.
+    try:
+        answer = _ask_camera(camera_sid, command)
+    except TimeoutError:
+        return {'error': 'timeout'}
+    return answer if isinstance(answer, dict) else {'error': 'failed'}
 
 
 def _release_stream(device_id):

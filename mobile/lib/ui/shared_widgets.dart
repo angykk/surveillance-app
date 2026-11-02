@@ -33,16 +33,32 @@ class OverlayPill extends StatelessWidget {
 
 /// A translucent round icon button for controls over a camera feed.
 class OverlayButton extends StatelessWidget {
-  const OverlayButton({super.key, required this.icon, required this.tooltip, required this.onPressed});
+  const OverlayButton({
+    super.key,
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+    this.active = false,
+  });
 
   final IconData icon;
   final String tooltip;
-  final VoidCallback onPressed;
+
+  /// Null shows the button disabled.
+  final VoidCallback? onPressed;
+
+  /// Shown inverted, for a toggle that's on (e.g. the mic while talking).
+  final bool active;
 
   @override
   Widget build(BuildContext context) {
     return IconButton.filled(
-      style: IconButton.styleFrom(backgroundColor: AppColors.overlay, foregroundColor: AppColors.white),
+      style: IconButton.styleFrom(
+        backgroundColor: active ? AppColors.white : AppColors.overlay,
+        foregroundColor: active ? AppColors.black : AppColors.white,
+        disabledBackgroundColor: AppColors.overlay,
+        disabledForegroundColor: AppColors.white.withValues(alpha: 0.35),
+      ),
       icon: Icon(icon),
       tooltip: tooltip,
       onPressed: onPressed,

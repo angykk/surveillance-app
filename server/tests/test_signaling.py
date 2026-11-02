@@ -1,4 +1,5 @@
 import jwt
+import pytest
 
 import signaling
 from conftest import LIVEKIT_SECRET, as_user, pair_camera, user_token
@@ -70,13 +71,17 @@ def test_watching_hands_out_scoped_livekit_grants(app, client):
     viewer_grant = _video_grant(_watch(alice, cam['device_id']))
     assert viewer_grant['room'] == cam['device_id']
     assert viewer_grant['canSubscribe'] is True
-    assert viewer_grant['canPublish'] is False
+    # Viewers may only publish a mic, to talk through the camera.
+    assert viewer_grant['canPublish'] is True
+    assert viewer_grant['canPublishSources'] == ['microphone']
     assert viewer_grant['canPublishData'] is False
 
     camera_grant = _video_grant(_last(camera, 'stream-start'))
     assert camera_grant['room'] == cam['device_id']
     assert camera_grant['canPublish'] is True
-    assert camera_grant['canSubscribe'] is False
+    assert camera_grant['canPublishSources'] == ['camera', 'microphone']
+    # To hear viewers talking.
+    assert camera_grant['canSubscribe'] is True
 
 
 def test_camera_streams_until_its_last_viewer_leaves(app, client):
@@ -321,3 +326,94 @@ def test_viewers_cannot_relabel_motion(app, client):
     alice.get_received()
     alice.emit('motion-label', {'label': 'person'})
     assert _last(alice, 'motion') is None
+
+
+def _control(viewer, device_id, action, **extra):
+    return viewer.emit('camera-control', {'camera_id': device_id, 'action': action, **extra}, callback=True)
+
+
+@pytest.fixture
+def asked(monkeypatch):
+    """Stands in for the camera answering `control` (test clients can't
+    answer the server): records each command and answers `{'ok': True}`."""
+    calls = []
+
+    def answer(camera_sid, command):
+        calls.append((camera_sid, command))
+        return {'ok': True}
+
+    monkeypatch.setattr(signaling, '_ask_camera', answer)
+    return calls
+
+
+def test_camera_controls_show_in_the_roster_while_online(app, client):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    alice = _connect_viewer(app, 'alice')
+    [listed] = _last(alice, 'cameras-list')
+    assert listed['controls'] is None
+
+    camera.emit('camera-controls', {'torch': True, 'has_torch': True, 'lens': 'sideways'})
+    [listed] = _last(alice, 'cameras-list')
+    # An unknown lens is the default rear one.
+    assert listed['controls'] == {'torch': True, 'has_torch': True, 'lens': 'back'}
+
+    # An unchanged report doesn't resend the roster.
+    camera.emit('camera-controls', {'torch': True, 'has_torch': True, 'lens': 'back'})
+    assert 'cameras-list' not in _names(alice)
+
+    camera.disconnect()
+    [listed] = _last(alice, 'cameras-list')
+    assert listed['controls'] is None
+
+
+def test_viewers_cannot_report_camera_controls(app, client):
+    pair_camera(client, 'alice')
+    alice = _connect_viewer(app, 'alice')
+    alice.get_received()
+    alice.emit('camera-controls', {'torch': True})
+    assert 'cameras-list' not in _names(alice)
+
+
+def test_camera_control_reaches_the_camera_and_acks_its_answer(app, client, asked):
+    cam = pair_camera(client, 'alice')
+    _connect_camera(app, cam['device_token'])
+    alice = _connect_viewer(app, 'alice')
+    camera_sid = signaling.cameras[cam['device_id']]['sid']
+
+    assert _control(alice, cam['device_id'], 'torch', on=True) == {'ok': True}
+    assert _control(alice, cam['device_id'], 'switch-lens', on=True) == {'ok': True}
+    assert _control(alice, cam['device_id'], 'snapshot') == {'ok': True}
+    # Only a torch command carries `on`.
+    assert asked == [
+        (camera_sid, {'action': 'torch', 'on': True}),
+        (camera_sid, {'action': 'switch-lens'}),
+        (camera_sid, {'action': 'snapshot'}),
+    ]
+
+
+def test_camera_control_needs_a_household_member_and_an_online_camera(app, client, asked):
+    cam = pair_camera(client, 'alice')
+    camera = _connect_camera(app, cam['device_token'])
+    bob = _connect_viewer(app, 'bob')
+    alice = _connect_viewer(app, 'alice')
+
+    assert _control(bob, cam['device_id'], 'snapshot') == {'error': 'offline'}
+    assert _control(alice, cam['device_id'], 'self-destruct') == {'error': 'unknown-action'}
+    # Cameras can't control each other (or themselves).
+    assert not _control(camera, cam['device_id'], 'snapshot')
+    camera.disconnect()
+    assert _control(alice, cam['device_id'], 'snapshot') == {'error': 'offline'}
+    assert asked == []
+
+
+def test_camera_control_times_out_if_the_camera_never_answers(app, client, monkeypatch):
+    cam = pair_camera(client, 'alice')
+    _connect_camera(app, cam['device_token'])
+    alice = _connect_viewer(app, 'alice')
+
+    def no_answer(camera_sid, command):
+        raise TimeoutError
+
+    monkeypatch.setattr(signaling, '_ask_camera', no_answer)
+    assert _control(alice, cam['device_id'], 'snapshot') == {'error': 'timeout'}

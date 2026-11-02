@@ -7,6 +7,7 @@ import '../api/motion_api.dart';
 import '../config.dart';
 import '../health/camera_health.dart';
 import '../motion/motion_label.dart';
+import '../signaling/camera_controls.dart';
 import '../signaling/signaling_client.dart';
 import 'app_theme.dart';
 import 'camera_health_badges.dart';
@@ -27,6 +28,7 @@ class CameraInfo {
     required this.lastSeenAt,
     this.detectionMode = DetectionMode.person,
     this.health,
+    this.controls,
   });
 
   final String id;
@@ -45,6 +47,9 @@ class CameraInfo {
   /// while offline. Null if it has never reported them.
   final CameraHealth? health;
 
+  /// Its torch and lens, while online and once it has reported them.
+  final CameraControls? controls;
+
   factory CameraInfo.fromJson(Map<dynamic, dynamic> json) => CameraInfo(
         id: json['id'] as String,
         name: json['name'] as String,
@@ -54,6 +59,7 @@ class CameraInfo {
         lastSeenAt: json['last_seen_at'] == null ? null : dateTimeFromEpochSeconds(json['last_seen_at'] as num),
         detectionMode: DetectionMode.fromName(json['detection_mode']),
         health: CameraHealth.fromJson(json['health']),
+        controls: CameraControls.fromJson(json['controls']),
       );
 }
 
