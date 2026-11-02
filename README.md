@@ -2,8 +2,9 @@
 
 Turn a spare phone into a security camera and watch it from another phone.
 
-- **Camera Mode:** streams live video and records a clip whenever it detects motion.
-- **Viewer Mode:** signs in, shows your cameras, and plays the live feed next to a timeline of motion events. Tap an event to play its clip. Several phones can watch the same camera at once.
+- **Camera Mode:** streams live video and records a clip whenever it detects motion. By default it only records when it sees a person, so lighting changes don't count. You can switch a camera to record any motion.
+- **Viewer Mode:** signs in, shows your cameras with their battery and status, and plays the live feed next to a timeline of motion events. Each event has a thumbnail. Tap one to play its clip, and share or delete clips from there. Several phones can watch the same camera at once.
+- **While watching live:** talk through the camera's speaker, turn its torch on or off, switch between its front and rear lens, or take a snapshot to save or share.
 
 ## Structure
 
@@ -107,7 +108,8 @@ Both phones must be able to reach `SERVER_IP` and LiveKit. For now, put them on 
 
 1. **Phone A:** choose **Viewer Mode**, create an account or sign in, then tap **Add camera** to show a pairing QR code.
 2. **Phone B:** choose **Camera Mode**, name the camera, and scan the code.
-3. On phone A, tap the camera to watch it live. Wave at it, and a motion event shows up in the timeline. Its clip becomes playable a few seconds after the motion stops.
+3. On phone A, tap the camera to watch it live. Walk past it, and a motion event shows up in the timeline. Its clip becomes playable a few seconds after the motion stops.
+4. Use the buttons at the bottom of the live feed to talk through the camera, toggle its torch, switch its lens, or take a snapshot.
 
 The camera phone keeps its screen on while Camera Mode runs. If it can't reach the server, it keeps finished clips (up to 500 MB) and uploads them once it's back online, even after an app restart.
 
