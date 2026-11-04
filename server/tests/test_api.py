@@ -50,6 +50,80 @@ def test_cannot_mint_pairing_codes_for_someone_elses_household(client):
     assert resp.status_code == 404
 
 
+def test_invite_adds_a_member_at_the_chosen_role(client):
+    household_id = home_household(client, 'alice')
+    invite = client.post(
+        f'/households/{household_id}/invites', json={'role': 'admin'}, headers=as_user('alice')
+    ).get_json()
+    assert invite['role'] == 'admin'
+
+    resp = client.post('/invites/accept', json={'code': invite['code']}, headers=as_user('bob'))
+    assert resp.status_code == 200
+    assert resp.get_json() == {'household_id': household_id, 'household_name': 'Home', 'role': 'admin'}
+
+    me = client.get('/me', headers=as_user('bob')).get_json()
+    assert {(h['id'], h['role']) for h in me['households']} >= {(household_id, 'admin')}
+
+
+def test_invite_defaults_to_viewer_and_rejects_owner(client):
+    household_id = home_household(client, 'alice')
+    invite = client.post(f'/households/{household_id}/invites', headers=as_user('alice')).get_json()
+    assert invite['role'] == 'viewer'
+    assert client.post(
+        f'/households/{household_id}/invites', json={'role': 'owner'}, headers=as_user('alice')
+    ).status_code == 400
+
+
+def test_invite_is_single_use(client):
+    household_id = home_household(client, 'alice')
+    code = client.post(f'/households/{household_id}/invites', headers=as_user('alice')).get_json()['code']
+    assert client.post('/invites/accept', json={'code': code}, headers=as_user('bob')).status_code == 200
+    assert client.post('/invites/accept', json={'code': code}, headers=as_user('carol')).status_code == 400
+
+
+def test_expired_invite_is_rejected(client, monkeypatch):
+    household_id = home_household(client, 'alice')
+    code = client.post(f'/households/{household_id}/invites', headers=as_user('alice')).get_json()['code']
+    real_time = time.time
+    monkeypatch.setattr(time, 'time', lambda: real_time() + 8 * 24 * 60 * 60)
+    assert client.post('/invites/accept', json={'code': code}, headers=as_user('bob')).status_code == 400
+
+
+def test_already_a_member_cannot_reaccept_their_own_invite(client):
+    household_id = home_household(client, 'alice')
+    code = client.post(f'/households/{household_id}/invites', headers=as_user('alice')).get_json()['code']
+    assert client.post('/invites/accept', json={'code': code}, headers=as_user('alice')).status_code == 409
+    # Left unredeemed, so someone else can still use it.
+    assert client.post('/invites/accept', json={'code': code}, headers=as_user('bob')).status_code == 200
+
+
+def test_viewer_cannot_create_or_list_invites(client):
+    household_id = home_household(client, 'alice')
+    code = client.post(f'/households/{household_id}/invites', headers=as_user('alice')).get_json()['code']
+    client.post('/invites/accept', json={'code': code}, headers=as_user('bob'))
+
+    resp = client.post(f'/households/{household_id}/invites', headers=as_user('bob'))
+    assert resp.status_code == 403
+    assert client.get(f'/households/{household_id}/invites', headers=as_user('bob')).status_code == 403
+
+
+def test_cannot_create_or_list_invites_for_someone_elses_household(client):
+    bobs_household = home_household(client, 'bob')
+    assert client.post(f'/households/{bobs_household}/invites', headers=as_user('alice')).status_code == 404
+    assert client.get(f'/households/{bobs_household}/invites', headers=as_user('alice')).status_code == 404
+
+
+def test_revoked_invite_cannot_be_accepted(client):
+    household_id = home_household(client, 'alice')
+    invite = client.post(f'/households/{household_id}/invites', headers=as_user('alice')).get_json()
+    listed = client.get(f'/households/{household_id}/invites', headers=as_user('alice')).get_json()
+    assert [i['code'] for i in listed] == [invite['code']]
+
+    assert client.delete(f'/households/{household_id}/invites/{invite["code"]}', headers=as_user('alice')).status_code == 204
+    assert client.post('/invites/accept', json={'code': invite['code']}, headers=as_user('bob')).status_code == 400
+    assert client.get(f'/households/{household_id}/invites', headers=as_user('alice')).get_json() == []
+
+
 def _motion_events(client, user_id, device_id):
     return client.get(f'/devices/{device_id}/motion-events', headers=as_user(user_id))
 

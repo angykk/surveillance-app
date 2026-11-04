@@ -51,6 +51,15 @@ create table if not exists pairing_codes (
   expires_at real not null,
   used_at real
 );
+create table if not exists invites (
+  code text primary key,
+  household_id text not null references households (id) on delete cascade,
+  role text not null check (role in ('admin', 'viewer')),
+  created_by text not null references users (id) on delete cascade,
+  expires_at real not null,
+  used_at real,
+  used_by text references users (id) on delete set null
+);
 create table if not exists motion_events (
   id text primary key,
   device_id text not null references devices (id) on delete cascade,

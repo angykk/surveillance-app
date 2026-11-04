@@ -193,3 +193,102 @@ def revoke_device(device_id):
     signaling.device_revoked(device_id, device['household_id'])
     return '', 204
 
+
+INVITE_ROLES = ('admin', 'viewer')
+INVITE_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+@bp.route('/households/<household_id>/invites', methods=['POST'])
+@auth.require_user
+def create_invite(household_id):
+    """Mints a week-long code for adding another person to this household,
+    as an admin or a viewer. Shown to share however the inviter likes (text,
+    QR); redeemed at POST /invites/accept."""
+    auth.require_member(household_id, roles=db.MANAGER_ROLES)
+    role = (request.get_json(silent=True) or {}).get('role', 'viewer')
+    if role not in INVITE_ROLES:
+        abort(400)
+    code = _new_pairing_code()
+    expires_at = db.now() + INVITE_TTL_SECONDS
+    db.table('invites').insert({
+        'code': code, 'household_id': household_id, 'role': role,
+        'created_by': g.user_id, 'expires_at': expires_at,
+    }).execute()
+    return jsonify({'code': code, 'role': role, 'expires_at': expires_at}), 201
+
+
+@bp.route('/households/<household_id>/invites')
+@auth.require_user
+def list_invites(household_id):
+    """Outstanding (unredeemed) invites for this household, so a manager can
+    see what's pending and revoke one."""
+    auth.require_member(household_id, roles=db.MANAGER_ROLES)
+    rows = (
+        db.table('invites')
+        .select('code', 'role', 'expires_at')
+        .eq('household_id', household_id)
+        .is_('used_at', 'null')
+        .order('expires_at')
+        .execute()
+        .data
+    )
+    return jsonify(rows)
+
+
+@bp.route('/households/<household_id>/invites/<code>', methods=['DELETE'])
+@auth.require_user
+def revoke_invite(household_id, code):
+    """Cancels a pending invite before it's redeemed."""
+    auth.require_member(household_id, roles=db.MANAGER_ROLES)
+    invite = db.first(
+        db.table('invites')
+        .select('code')
+        .eq('code', code)
+        .eq('household_id', household_id)
+        .is_('used_at', 'null')
+        .execute()
+    )
+    if invite is None:
+        abort(404)
+    db.table('invites').delete().eq('code', code).execute()
+    return '', 204
+
+
+@bp.route('/invites/accept', methods=['POST'])
+@auth.require_user
+def accept_invite():
+    """Trades an invite code for membership in its household, at the role
+    the invite was minted for."""
+    code = ((request.get_json(silent=True) or {}).get('code') or '').strip().upper()
+    ts = db.now()
+    invite = db.first(
+        db.table('invites').select('household_id', 'role').eq('code', code)
+        .is_('used_at', 'null').gt('expires_at', ts).execute()
+    )
+    if invite is None:
+        abort(400)
+    household_id = invite['household_id']
+    if auth.role_in(g.user_id, household_id) is not None:
+        # Already a member: leave the invite unredeemed, so it still works
+        # for whoever else it was meant for.
+        abort(409)
+
+    # Claiming with a single conditional UPDATE, as in /devices/pair, so two
+    # people redeeming the same code at once can't both win it.
+    claimed = db.first(
+        db.table('invites')
+        .update({'used_at': ts, 'used_by': g.user_id})
+        .eq('code', code)
+        .is_('used_at', 'null')
+        .gt('expires_at', ts)
+        .execute()
+    )
+    if claimed is None:
+        abort(400)
+    db.table('memberships').insert({
+        'user_id': g.user_id, 'household_id': household_id, 'role': invite['role'], 'created_at': ts,
+    }).execute()
+    household = db.first(db.table('households').select('name').eq('id', household_id).execute())
+    signaling.refresh_user_memberships(g.user_id)
+    return jsonify({'household_id': household_id, 'household_name': household['name'], 'role': invite['role']})
+

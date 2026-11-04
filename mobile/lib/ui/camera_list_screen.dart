@@ -9,8 +9,10 @@ import '../health/camera_health.dart';
 import '../motion/motion_label.dart';
 import '../signaling/camera_controls.dart';
 import '../signaling/signaling_client.dart';
+import 'accept_invite_screen.dart';
 import 'app_theme.dart';
 import 'camera_health_badges.dart';
+import 'invite_screen.dart';
 import 'pairing_code_screen.dart';
 import 'rename_dialog.dart';
 import 'shared_widgets.dart';
@@ -206,36 +208,66 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
     );
   }
 
-  Future<void> _addCamera() async {
+  /// Lets the user pick which of their manageable households an action
+  /// (adding a camera, inviting someone) applies to, skipping the picker
+  /// when there's only one. Null if they have none, after telling them so.
+  Future<Household?> _pickManageableHousehold(String sheetTitle, String noneMessage) async {
     final manageable = _households.values.where((h) => h.canManage).toList();
     if (manageable.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Only household owners and admins can add cameras.')),
-      );
-      return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(noneMessage)));
+      return null;
     }
-    final household = manageable.length == 1
-        ? manageable.single
-        : await showModalBottomSheet<Household>(
-            context: context,
-            builder: (context) => SafeArea(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const ListTile(title: Text('Add camera to…')),
-                  for (final h in manageable)
-                    ListTile(
-                      leading: const Icon(Icons.home_outlined),
-                      title: Text(h.name),
-                      onTap: () => Navigator.of(context).pop(h),
-                    ),
-                ],
+    if (manageable.length == 1) return manageable.single;
+    return showModalBottomSheet<Household>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(title: Text(sheetTitle)),
+            for (final h in manageable)
+              ListTile(
+                leading: const Icon(Icons.home_outlined),
+                title: Text(h.name),
+                onTap: () => Navigator.of(context).pop(h),
               ),
-            ),
-          );
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _addCamera() async {
+    final household = await _pickManageableHousehold(
+      'Add camera to…',
+      'Only household owners and admins can add cameras.',
+    );
     if (household == null || !mounted) return;
     await Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => PairingCodeScreen(api: _householdsApi, household: household)),
+    );
+  }
+
+  Future<void> _inviteToHousehold() async {
+    final household = await _pickManageableHousehold(
+      'Invite to…',
+      'Only household owners and admins can invite members.',
+    );
+    if (household == null || !mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => InviteScreen(api: _householdsApi, household: household)),
+    );
+  }
+
+  Future<void> _joinHousehold() async {
+    final accepted = await Navigator.of(context).push<AcceptedInvite>(
+      MaterialPageRoute(builder: (_) => AcceptInviteScreen(api: _householdsApi)),
+    );
+    if (accepted == null || !mounted) return;
+    await _loadHouseholds();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Joined ${accepted.householdName} as ${accepted.role}.')),
     );
   }
 
@@ -306,6 +338,10 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
                   supabase.auth.signOut();
                 case _SettingsAction.switchMode:
                   _confirmSwitchMode();
+                case _SettingsAction.inviteMember:
+                  _inviteToHousehold();
+                case _SettingsAction.joinHousehold:
+                  _joinHousehold();
               }
             },
             itemBuilder: (context) => [
@@ -323,6 +359,24 @@ class _CameraListScreenState extends State<CameraListScreen> with WidgetsBinding
                 child: ListTile(
                   leading: Icon(Icons.swap_horiz),
                   title: Text('Switch mode'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              const PopupMenuDivider(),
+              if (_households.values.any((h) => h.canManage))
+                const PopupMenuItem(
+                  value: _SettingsAction.inviteMember,
+                  child: ListTile(
+                    leading: Icon(Icons.person_add_alt_outlined),
+                    title: Text('Invite someone'),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+              const PopupMenuItem(
+                value: _SettingsAction.joinHousehold,
+                child: ListTile(
+                  leading: Icon(Icons.group_add_outlined),
+                  title: Text('Join a household'),
                   contentPadding: EdgeInsets.zero,
                 ),
               ),
@@ -468,7 +522,7 @@ class _CameraLeadingIcon extends StatelessWidget {
   }
 }
 
-enum _SettingsAction { signOut, switchMode }
+enum _SettingsAction { signOut, switchMode, inviteMember, joinHousehold }
 
 /// AppBar action for picking the app's light/dark/system theme. Lives on
 /// Viewer Mode's screens only — Camera Mode runs unattended, so there's no

@@ -74,6 +74,21 @@ create table if not exists public.pairing_codes (
 create index if not exists pairing_codes_household_id_idx on public.pairing_codes (household_id);
 create index if not exists pairing_codes_created_by_idx on public.pairing_codes (created_by);
 
+-- Adds another person to a household, at a role chosen when the invite is
+-- minted (owner isn't offered: a household gets its one owner at creation).
+-- Shared by the inviter however they like (text, QR) and redeemed once at
+-- POST /invites/accept.
+create table if not exists public.invites (
+  code text primary key,
+  household_id uuid not null references public.households (id) on delete cascade,
+  role text not null check (role in ('admin', 'viewer')),
+  created_by uuid not null references public.users (id) on delete cascade,
+  expires_at double precision not null,
+  used_at double precision,
+  used_by uuid references public.users (id) on delete set null
+);
+create index if not exists invites_household_id_idx on public.invites (household_id);
+
 -- One row per stretch of motion a camera saw: opened when its motion
 -- detector fires, closed (ended_at set) once it has been still for a few
 -- seconds, or when the camera disconnects. The camera records a clip of
@@ -159,6 +174,7 @@ alter table public.households enable row level security;
 alter table public.memberships enable row level security;
 alter table public.devices enable row level security;
 alter table public.pairing_codes enable row level security;
+alter table public.invites enable row level security;
 alter table public.motion_events enable row level security;
 alter table public.clip_deletions enable row level security;
 

@@ -42,8 +42,48 @@ class PairingCode {
   }
 }
 
+/// A pending invite into a household, at a fixed role ('admin' or
+/// 'viewer' — a household already has its one owner). Share the code
+/// however's convenient; whoever redeems it first gets the role.
+class Invite {
+  const Invite({required this.code, required this.role, required this.expiresAt});
+
+  final String code;
+  final String role;
+  final DateTime expiresAt;
+
+  /// What the QR code encodes. The prefix lets a scanner ignore unrelated
+  /// QR codes instead of trying to redeem them.
+  String get qrPayload => '$qrPrefix$code';
+
+  static const qrPrefix = 'survcam:invite:';
+
+  /// Accepts either a scanned QR payload or a hand-typed code.
+  static String? parse(String raw) {
+    final value = raw.trim();
+    final code = value.startsWith(qrPrefix) ? value.substring(qrPrefix.length) : value;
+    final normalized = code.toUpperCase().replaceAll(RegExp(r'[\s-]'), '');
+    return RegExp(r'^[A-Z0-9]{8}$').hasMatch(normalized) ? normalized : null;
+  }
+
+  factory Invite.fromJson(Map<String, dynamic> json) => Invite(
+        code: json['code'] as String,
+        role: json['role'] as String,
+        expiresAt: dateTimeFromEpochSeconds(json['expires_at'] as num),
+      );
+}
+
+/// What accepting an invite joins the signed-in user into.
+class AcceptedInvite {
+  const AcceptedInvite({required this.householdId, required this.householdName, required this.role});
+
+  final String householdId;
+  final String householdName;
+  final String role;
+}
+
 /// Viewer Mode's account-level calls: the signed-in user's households, and
-/// managing the cameras paired into them.
+/// managing the cameras and members in them.
 class HouseholdsApi {
   HouseholdsApi(this._client);
 
@@ -76,4 +116,31 @@ class HouseholdsApi {
 
   Future<void> removeCamera(String deviceId) =>
       _client.send('DELETE', '/devices/$deviceId', expectStatus: 204);
+
+  Future<Invite> createInvite(String householdId, String role) async {
+    final json = await _client.send(
+      'POST',
+      '/households/$householdId/invites',
+      json: {'role': role},
+      expectStatus: 201,
+    ) as Map<String, dynamic>;
+    return Invite.fromJson(json);
+  }
+
+  Future<List<Invite>> listInvites(String householdId) async {
+    final list = await _client.send('GET', '/households/$householdId/invites') as List;
+    return list.cast<Map<String, dynamic>>().map(Invite.fromJson).toList();
+  }
+
+  Future<void> revokeInvite(String householdId, String code) =>
+      _client.send('DELETE', '/households/$householdId/invites/$code', expectStatus: 204);
+
+  Future<AcceptedInvite> acceptInvite(String code) async {
+    final json = await _client.send('POST', '/invites/accept', json: {'code': code}) as Map<String, dynamic>;
+    return AcceptedInvite(
+      householdId: json['household_id'] as String,
+      householdName: json['household_name'] as String,
+      role: json['role'] as String,
+    );
+  }
 }
